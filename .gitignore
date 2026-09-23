@@ -1,0 +1,14 @@
+# Secrets and local state. Never commit these.
+.env
+.linkedin-tokens.json
+.receipts/
+.publisher.lock
+publisher.log
+
+# Python
+__pycache__/
+*.egg-info/
+.venv/
+.pytest_cache/
+build/
+dist/

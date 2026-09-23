@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS: signals every 15 minutes when a post is due. It never posts.
+  Change the two paths, copy to ~/Library/LaunchAgents/ and run:
+    launchctl load ~/Library/LaunchAgents/com.example.linkedin-publisher.plist
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.example.linkedin-publisher</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/YOU/.local/bin/linkedin-publisher</string>
+    <string>--config</string>
+    <string>/Users/YOU/linkedin/publisher.toml</string>
+    <string>publish</string>
+    <string>--notify</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>900</integer>
+  <key>StandardErrorPath</key>
+  <string>/tmp/linkedin-publisher.err</string>
+</dict>
+</plist>
