@@ -4,6 +4,8 @@
 .receipts/
 .publisher.lock
 publisher.log
+schedule.log
+.last-check
 
 # Python
 __pycache__/

@@ -27,6 +27,7 @@ class Config:
     receipts_dir: Path
     lock_file: Path
     log_file: Path
+    heartbeat_file: Path
     ready_status: str = "queued"
     published_status: str = "published"
     expires_key: str = "expires"
@@ -35,6 +36,7 @@ class Config:
     grace_minutes: int = 90
     redirect_port: int = 8765
     api_version: str = "202606"
+    config_path: Path | None = None
 
 
 def find_config(explicit: str | None) -> Path | None:
@@ -94,6 +96,7 @@ def load_config(explicit: str | None = None) -> Config:
         receipts_dir=resolve("receipts", ".receipts"),
         lock_file=resolve("lock_file", ".publisher.lock"),
         log_file=resolve("log_file", "publisher.log"),
+        heartbeat_file=resolve("heartbeat_file", ".last-check"),
         ready_status=str(fm.get("ready_status", "queued")),
         published_status=str(fm.get("published_status", "published")),
         expires_key=str(fm.get("expires_key", "expires")),
@@ -102,4 +105,5 @@ def load_config(explicit: str | None = None) -> Config:
         grace_minutes=int(slots.get("grace_minutes", 90)),
         redirect_port=int(data.get("auth", {}).get("redirect_port", 8765)),
         api_version=str(data.get("api", {}).get("version", "202606")),
+        config_path=path.resolve() if path is not None else None,
     )

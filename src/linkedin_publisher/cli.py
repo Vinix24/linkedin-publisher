@@ -11,7 +11,7 @@ from pathlib import Path
 
 import requests
 
-from . import __version__, api, littletext, postqueue as queue, templates
+from . import __version__, api, cloud, littletext, postqueue as queue, schedule, templates
 from .config import DEFAULT_CONFIG_NAME, Config, ConfigError, load_config
 
 TOKEN_WARN_DAYS = 7
@@ -44,6 +44,25 @@ def notify(title: str, message: str) -> None:
         pass
 
 
+def write_heartbeat(cfg: Config, now: dt.datetime) -> None:
+    """Written at the start of every scheduled run, whether or not a post is due.
+    It answers 'is the schedule running?', which an empty log cannot."""
+    try:
+        cfg.heartbeat_file.parent.mkdir(parents=True, exist_ok=True)
+        cfg.heartbeat_file.write_text(now.isoformat(timespec="seconds"), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def last_check_line(cfg: Config, now: dt.datetime | None = None) -> str:
+    if not cfg.heartbeat_file.exists():
+        return "Last check: never. The schedule has not run yet."
+    last = dt.datetime.fromisoformat(cfg.heartbeat_file.read_text(encoding="utf-8").strip())
+    minutes = int(((now or dt.datetime.now()) - last).total_seconds() // 60)
+    warning = "  <- more than 30 minutes ago, is the computer asleep or the job gone?" if minutes > 30 else ""
+    return f"Last check: {last:%Y-%m-%d %H:%M} ({minutes} min ago){warning}"
+
+
 def token_line(cfg: Config) -> str | None:
     days = api.token_days_left(cfg)
     if days is None:
@@ -57,12 +76,16 @@ def token_line(cfg: Config) -> str | None:
 
 # ----------------------------------------------------------------------- commands
 
-def cmd_init(target: Path) -> None:
+def cmd_init(target: Path, github: bool = False, tz_name: str | None = None) -> None:
     target.mkdir(parents=True, exist_ok=True)
     created = []
-    for name, content in ((DEFAULT_CONFIG_NAME, templates.CONFIG), (".env", templates.ENV),
-                          (".gitignore", templates.GITIGNORE),
-                          ("queue/2026-01-05-example.md", templates.EXAMPLE_POST)):
+    files = [(DEFAULT_CONFIG_NAME, templates.CONFIG), (".env", templates.ENV),
+             (".gitignore", cloud.GITIGNORE if github else templates.GITIGNORE),
+             ("queue/2026-01-05-example.md", templates.EXAMPLE_POST)]
+    if github:
+        tz_name = tz_name or cloud.local_timezone()
+        files += list(cloud.workflows(tz_name, __version__).items())
+    for name, content in files:
         path = target / name
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists():
@@ -75,10 +98,20 @@ def cmd_init(target: Path) -> None:
     print(f"Initialized {target}")
     for name in created:
         print(f"  created {name}")
-    print("\nNext: fill in .env (see README, 'Set up LinkedIn'), then run: linkedin-publisher auth")
+    if not github:
+        print("\nNext: fill in .env (see README, 'Set up LinkedIn'), then run: linkedin-publisher auth")
+        return
+    print(f"\nGitHub Actions mode, timezone {tz_name}. Next:")
+    print("  1. Fill in .env, then run: linkedin-publisher auth")
+    print("  2. git init && git add -A && git commit -m 'LinkedIn queue'")
+    print("     gh repo create my-linkedin-queue --private --source . --push")
+    print("  3. gh secret set LINKEDIN_CLIENT_ID")
+    print("     gh secret set LINKEDIN_CLIENT_SECRET")
+    print("     gh secret set LINKEDIN_TOKENS < .linkedin-tokens.json")
+    print("  4. Queue a post (status: queued, a slot) and git push. Keep the repository private.")
 
 
-def cmd_status(cfg: Config, online: bool = False) -> None:
+def cmd_status(cfg: Config, online: bool = False, fail_days: int | None = None) -> int:
     files = queue.queue_files(cfg) if cfg.queue_dir.exists() else []
     print(f"linkedin-publisher {__version__}")
     print(f"root:      {cfg.root}")
@@ -89,6 +122,12 @@ def cmd_status(cfg: Config, online: bool = False) -> None:
     print(token_line(cfg) or "No tokens yet. Run 'linkedin-publisher auth'.")
     if online:
         print(f"LinkedIn accepts the token. Posting as: {api.verify_online(cfg)}")
+    if fail_days is not None:
+        days = api.token_days_left(cfg)
+        if days is None or days <= fail_days:
+            print(f"FAIL: the token expires within {fail_days} days or is missing.", file=sys.stderr)
+            return 2
+    return 0
 
 
 def cmd_due(cfg: Config, now: dt.datetime) -> None:
@@ -140,6 +179,23 @@ def cmd_check(cfg: Config) -> None:
         print()
 
 
+def cmd_schedule(cfg: Config, action: str, auto: bool) -> None:
+    if cfg.config_path is None:
+        raise api.PublisherError("schedule needs a config file. Run it next to publisher.toml "
+                                 "or pass --config.")
+    if action == "install":
+        where = schedule.install(cfg.config_path, auto, cfg.root / "schedule.log")
+        mode = "posts automatically when a post is due" if auto else "notifies you when a post is due"
+        print(f"Installed {where}. Every 15 minutes it {mode}.")
+        print("It only runs while this computer is on. For a computer that may be off, "
+              "use the GitHub Actions mode (see README).")
+    elif action == "remove":
+        print(schedule.remove(cfg.config_path))
+    else:
+        print(schedule.show(cfg.config_path))
+        print(last_check_line(cfg))
+
+
 def resolve_file(cfg: Config, raw: str) -> Path:
     path = Path(raw).expanduser()
     if not path.is_absolute():
@@ -151,6 +207,8 @@ def resolve_file(cfg: Config, raw: str) -> Path:
 def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None) -> int:
     """mode: dry (show) | notify (signal, never post) | post (post for real)."""
     log = make_log(cfg)
+    if mode == "notify" or (mode == "post" and only is None):
+        write_heartbeat(cfg, now)
 
     if only is not None:
         if mode == "notify":
@@ -249,11 +307,20 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command")
     init = sub.add_parser("init", help="create a config, .env and queue in a folder")
     init.add_argument("folder", nargs="?", default=".")
+    init.add_argument("--github", action="store_true",
+                      help="also add GitHub Actions workflows, so posting works with your computer off")
+    init.add_argument("--timezone", help="IANA timezone for the workflows (default: this computer's)")
     sub.add_parser("auth", help="sign in with LinkedIn and store tokens")
     sub.add_parser("refresh", help="refresh the access token if a refresh token exists")
     status = sub.add_parser("status", help="show paths, queue size and token lifetime")
     status.add_argument("--online", action="store_true",
                         help="also ask LinkedIn whether the token works (read-only, posts nothing)")
+    status.add_argument("--fail-days", type=int, metavar="N",
+                        help="exit with code 2 when the token expires within N days (for CI)")
+    sch = sub.add_parser("schedule", help="run every 15 minutes on this computer (launchd or cron)")
+    sch.add_argument("action", choices=["install", "remove", "show"])
+    sch.add_argument("--auto", action="store_true",
+                     help="post automatically when due, instead of only notifying")
     sub.add_parser("due", help="show what is due and why other posts are skipped")
     sub.add_parser("check", help="dry run over the whole queue, no network")
     pub = sub.add_parser("publish", help="show, signal or post the next due post")
@@ -269,7 +336,7 @@ def main(argv: list[str] | None = None) -> int:
     command = args.command or "due"
     try:
         if command == "init":
-            cmd_init(Path(args.folder).expanduser().resolve())
+            cmd_init(Path(args.folder).expanduser().resolve(), args.github, args.timezone)
             return 0
         cfg = load_config(args.config)
         now = dt.datetime.now()
@@ -278,7 +345,9 @@ def main(argv: list[str] | None = None) -> int:
         elif command == "refresh":
             api.ensure_access_token(cfg, api.load_credentials(cfg), api.read_tokens(cfg), make_log(cfg))
         elif command == "status":
-            cmd_status(cfg, args.online)
+            return cmd_status(cfg, args.online, args.fail_days)
+        elif command == "schedule":
+            cmd_schedule(cfg, args.action, args.auto)
         elif command == "due":
             cmd_due(cfg, now)
         elif command == "check":
@@ -288,7 +357,7 @@ def main(argv: list[str] | None = None) -> int:
             only = resolve_file(cfg, args.file) if args.file else None
             return cmd_publish(cfg, now, mode, only)
         return 0
-    except (ConfigError, api.PublisherError) as exc:
+    except (ConfigError, api.PublisherError, schedule.ScheduleError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
     except requests.RequestException as exc:

@@ -58,4 +58,6 @@ GITIGNORE = """\
 .receipts/
 .publisher.lock
 publisher.log
+schedule.log
+.last-check
 """

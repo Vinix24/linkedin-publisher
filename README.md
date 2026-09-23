@@ -4,7 +4,8 @@ Write your LinkedIn posts as Markdown files. Put them in a folder with a date an
 When a post is due, you get a signal. You run one command and it goes out through LinkedIn's
 official API, and the file moves to a `published` folder with its URL.
 
-It never posts on its own. A person presses the button.
+Nothing goes out unless a person decided it should. Either you press the button when a post
+is due, or you decide in advance by marking a post `queued`.
 
 ```
 queue/2026-10-01-my-post.md   ->   linkedin-publisher publish --post   ->   published/2026-10-01-my-post.md
@@ -40,6 +41,32 @@ the receipt still blocks a second attempt, even if you rename the file.
 | Markdown in your files (converted to plain text) | Polls |
 | Hashtags | Posting as a company page |
 | Private notes below the post that are never sent | Scheduling inside LinkedIn itself |
+
+## Read this before you start: scheduling needs something that runs
+
+LinkedIn's API cannot schedule a post. It can only post right now. So at the moment a post is
+due, something has to run. There are two ways, and both have limits you should know about.
+
+| | On your computer | In GitHub Actions |
+|---|---|---|
+| Set up with | `linkedin-publisher schedule install` | `linkedin-publisher init --github` |
+| Works when your computer is off | **No** | Yes |
+| Who decides that a post goes out | You, when it is due (default), or in advance with `--auto` | You, in advance, by marking it `queued` and pushing |
+| Cost | Nothing | Actions minutes, see below |
+| Timing | Within 15 minutes of the slot | At the first run after the slot, usually within 30 minutes, sometimes later when GitHub is busy |
+
+**On your computer** it only runs while the computer is on and awake. A Mac that was asleep
+runs once when it wakes up. A post more than 90 minutes late is then not posted, on purpose:
+a post about this morning's news should not appear in the evening.
+
+**In GitHub Actions** there is no approval button at posting time. On GitHub Free, Pro and
+Team, required reviewers for workflow runs are only available in public repositories, and
+your queue of unpublished posts belongs in a private one. So in this mode the decision is the
+moment you set `status: queued` and push. That is how most scheduling tools work.
+
+**The token expires after about 60 days** in both modes. You then run
+`linkedin-publisher auth` again on your own computer. In GitHub Actions mode you also update
+one secret, and a daily check turns red a week before, so posting does not stop by surprise.
 
 ## Install
 
@@ -141,18 +168,57 @@ A post that missed its slot by more than 90 minutes is not posted late. You get 
 instead, and you decide. Change `grace_minutes` in `publisher.toml` if you want a
 different window.
 
-## Get a reminder when a post is due
+## Run it on your computer
 
-`publish --notify` checks the queue and shows a desktop notification when something is due.
-It never posts. Run it every 15 minutes.
-
-**macOS:** edit and load `examples/launchd/com.example.linkedin-publisher.plist`.
-
-**Linux** (uses `notify-send`), in `crontab -e`:
-
+```bash
+linkedin-publisher schedule install          # every 15 minutes: notify when a post is due
+linkedin-publisher schedule install --auto   # every 15 minutes: post when a post is due
+linkedin-publisher schedule show             # is it installed, and when did it last run
+linkedin-publisher schedule remove
 ```
-*/15 * * * * linkedin-publisher --config /home/you/linkedin/publisher.toml publish --notify
+
+macOS uses launchd, Linux uses cron. On Windows, use Task Scheduler to run
+`linkedin-publisher publish --notify` every 15 minutes, or use GitHub Actions.
+
+`schedule show` tells you when the last check ran. If that is more than 30 minutes ago, the
+computer was asleep or the job is gone. An empty log alone cannot tell you that.
+
+## Run it in GitHub Actions (computer may be off)
+
+```bash
+mkdir my-linkedin-queue && cd my-linkedin-queue
+linkedin-publisher init --github            # uses your computer's timezone, or pass --timezone
+
+# fill in .env, then:
+linkedin-publisher auth
+
+git init && git add -A && git commit -m "LinkedIn queue"
+gh repo create my-linkedin-queue --private --source . --push
+
+gh secret set LINKEDIN_CLIENT_ID
+gh secret set LINKEDIN_CLIENT_SECRET
+gh secret set LINKEDIN_TOKENS < .linkedin-tokens.json
 ```
+
+**Keep this repository private.** It holds posts you have not published yet.
+
+To schedule a post: write it in `queue/`, set `status: queued` and a `slot`, and push. The
+workflow posts it, moves it to `published/` with its URL, and commits that back, together
+with the receipt that stops it from going out twice.
+
+What `init --github` adds:
+
+- `.github/workflows/linkedin-publisher.yml` runs every 30 minutes between 06:00 and 22:59
+  in your timezone. Posts are published in that timezone, not in UTC.
+- `.github/workflows/linkedin-token-check.yml` runs once a day and fails during the last
+  week before your token expires. Renew with:
+  `linkedin-publisher auth && gh secret set LINKEDIN_TOKENS < .linkedin-tokens.json`
+- a `.gitignore` that keeps secrets out but commits the queue, published posts and receipts.
+
+**Actions minutes.** The publish workflow runs about 1,100 times a month. Even if every run
+counted as a full minute, that stays well under the 2,000 free minutes a month for private
+repositories on GitHub Free. Check your usage under *Settings, Billing* if you run other
+workflows in private repositories too.
 
 ## Configuration
 
@@ -201,7 +267,7 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
 ```
 
 The tests cover the parts that can go wrong without anyone noticing: frontmatter parsing,
-escaping, slots, receipts and moving files. The calls to LinkedIn itself are not unit
+escaping, slots, receipts, moving files, the schedule files and the generated workflows. The calls to LinkedIn itself are not unit
 tested. `status --online` is the safe way to check them.
 
 ## License
