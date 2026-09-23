@@ -215,6 +215,7 @@ def write_receipt(cfg: Config, stage: str, post: Post | None = None, *,
     stage: placed | preflight-rejected | failed | move-failed"""
     now = dt.datetime.now(dt.UTC)
     row: dict[str, Any] = {
+        "event": "linkedin_publish",
         "stage": stage,
         "file": post.path.name if post else None,
         "content_key": content_key(post_text(post.body, cfg.notes_headings)) if post else None,
