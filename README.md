@@ -255,6 +255,7 @@ sun = "11:00"
 | `426` when posting | LinkedIn retired the API version. Set `LINKEDIN_API_VERSION=YYYYMM` in `.env` to a current month. |
 | `preflight: REFUSED` | Something in the text is still unsafe. Run `check` to see what. |
 | "a receipt shows this was already posted" | The post is live. The file stayed behind. Move it by hand. |
+| GitHub Actions: "The job was not started because recent account payments have failed or your spending limit needs to be increased" | Actions in private repositories are blocked on your GitHub account. Nothing is posted until you fix it under *Settings, Billing and plans*. The run is red, so you will see it. |
 
 The files in `.receipts/` are a plain log of every attempt, one JSON line each.
 
