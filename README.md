@@ -55,6 +55,8 @@ due, something has to run. There are two ways, and both have limits you should k
 | Cost | Nothing | Actions minutes, see below |
 | Timing | Within 15 minutes of the slot | At the first run after the slot, usually within 30 minutes, sometimes later when GitHub is busy |
 
+A server that is always on (Hetzner, Google Cloud, a Raspberry Pi) is a third option. See *Other places to run it*.
+
 **On your computer** it only runs while the computer is on and awake. A Mac that was asleep
 runs once when it wakes up. A post more than 90 minutes late is then not posted, on purpose:
 a post about this morning's news should not appear in the evening.
@@ -219,6 +221,36 @@ What `init --github` adds:
 counted as a full minute, that stays well under the 2,000 free minutes a month for private
 repositories on GitHub Free. Check your usage under *Settings, Billing* if you run other
 workflows in private repositories too.
+
+## Other places to run it
+
+Any Linux machine that is always on works, with no extra code: a small server at Hetzner or
+DigitalOcean, a virtual machine at Google Cloud, AWS or Azure, or a Raspberry Pi at home.
+`schedule` uses cron there.
+
+```bash
+pipx install git+https://github.com/Vinix24/linkedin-publisher
+mkdir ~/linkedin && cd ~/linkedin && linkedin-publisher init
+# copy .env and .linkedin-tokens.json from the computer where you ran `auth`
+linkedin-publisher status --online
+linkedin-publisher schedule install --auto
+```
+
+Three things to know:
+
+- **`auth` needs a browser**, which a server does not have. Run it on your own computer and
+  copy `.linkedin-tokens.json` to the server. Do the same when the token expires.
+- **Use `--auto` on a server.** A desktop notification reaches no one there. The approval
+  moment is then the same as in GitHub Actions: marking a post `queued`.
+- **Getting posts onto the server.** Write them there, or keep the queue in a private git
+  repository and run `git pull` before and `git push` after, the way the GitHub Actions
+  workflow does.
+
+Serverless runtimes such as Cloud Run jobs or AWS Lambda do not work out of the box. The tool
+keeps its queue, published posts and receipts on disk between runs, and those runtimes start
+empty every time.
+
+Scheduling on Linux is covered by the tests but has not yet been run on a real server.
 
 ## Configuration
 
