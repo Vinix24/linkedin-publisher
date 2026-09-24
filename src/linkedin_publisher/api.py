@@ -34,6 +34,13 @@ class PreflightRejected(PublisherError):
     """The text would still contain an unescaped reserved character. Not sent."""
 
 
+class PublishUncertain(PublisherError):
+    """LinkedIn may have created the post, but there is no clear answer.
+
+    A timeout, a lost connection, a server error, or a success without a post id.
+    Retrying automatically could post the same text twice, so the tool never does."""
+
+
 # ------------------------------------------------------------------ credentials
 
 def load_credentials(cfg: Config) -> dict[str, str]:
@@ -232,7 +239,8 @@ def upload_image(session: requests.Session, author: str, image_path: Path) -> st
 
 
 def publish(cfg: Config, creds: dict[str, str], tokens: dict[str, Any], commentary: str,
-            image: Path | None = None, alt_text: str | None = None) -> str:
+            image: Path | None = None, alt_text: str | None = None,
+            posts_url: str = POSTS_URL) -> str:
     """Post it. Returns the post URN."""
     from .littletext import find_unescaped
 
@@ -250,18 +258,28 @@ def publish(cfg: Config, creds: dict[str, str], tokens: dict[str, Any], commenta
     })
     author = tokens["author_urn"]
     image_urn = upload_image(session, author, image) if image else None
-    resp = session.post(POSTS_URL, json=build_post_payload(author, commentary, image_urn, alt_text),
-                        timeout=60)
+    try:
+        resp = session.post(posts_url, json=build_post_payload(author, commentary, image_urn, alt_text),
+                            timeout=60)
+    except requests.RequestException as exc:
+        raise PublishUncertain(f"No clear answer from LinkedIn ({exc}). The post may be live.") from exc
     if resp.status_code == 426:
         raise PublisherError(f"LinkedIn no longer accepts API version {api_version(cfg, creds)}. "
                              "Set a newer LINKEDIN_API_VERSION (format YYYYMM) in your .env. "
                              f"Response: {resp.text}")
+    if resp.status_code >= 500:
+        raise PublishUncertain(f"LinkedIn answered with a server error ({resp.status_code}). "
+                               "The post may be live.")
     if resp.status_code not in (200, 201):
-        raise PublisherError(f"Posting failed ({resp.status_code}): {resp.text}")
-    urn = resp.headers.get("x-restli-id") or (resp.json().get("id", "") if resp.text else "")
+        raise PublisherError(f"LinkedIn refused the post ({resp.status_code}): {resp.text}")
+    urn = resp.headers.get("x-restli-id") or ""
+    if not urn and resp.text:
+        try:
+            urn = resp.json().get("id", "")
+        except ValueError:
+            urn = ""
     if not urn:
-        raise PublisherError("Posted, but no post id came back. Check LinkedIn by hand. "
-                             f"Response: {resp.text}")
+        raise PublishUncertain("LinkedIn accepted the post but returned no id. It is probably live.")
     return urn
 
 

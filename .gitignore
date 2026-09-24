@@ -6,6 +6,7 @@
 publisher.log
 schedule.log
 .last-check
+.token-warned
 
 # Python
 __pycache__/

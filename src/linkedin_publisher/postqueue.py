@@ -104,7 +104,7 @@ def collect(cfg: Config, now: dt.datetime) -> tuple[list[Post], list[Post]]:
     """Return (ready to post, skipped with a reason)."""
     ready: list[Post] = []
     skipped: list[Post] = []
-    placed = load_placed_keys(cfg)
+    states = load_states(cfg)
     for md_path in queue_files(cfg):
         try:
             post = read_post(md_path)
@@ -115,8 +115,14 @@ def collect(cfg: Config, now: dt.datetime) -> tuple[list[Post], list[Post]]:
 
         # First and strongest check: a receipt that proves this text was placed.
         # This covers a post that went live but whose file could not be moved.
-        if content_key(post_text(post.body, cfg.notes_headings)) in placed:
+        state = states.get(content_key(post_text(post.body, cfg.notes_headings)))
+        if state == "placed":
             post.reason = "a receipt shows this was already posted, file is ignored"
+            skipped.append(post)
+            continue
+        if state in UNCERTAIN_STAGES:
+            post.reason = ("an earlier attempt may have gone through. Check LinkedIn. If the post "
+                           f"is not there: linkedin-publisher publish --post --file {post.path} --retry")
             skipped.append(post)
             continue
 
@@ -212,7 +218,7 @@ def write_receipt(cfg: Config, stage: str, post: Post | None = None, *,
                   error: str | None = None) -> None:
     """Append-only NDJSON, one file per day.
 
-    stage: placed | preflight-rejected | failed | move-failed"""
+    stage: attempt | placed | uncertain | failed | preflight-rejected | move-failed | stranded"""
     now = dt.datetime.now(dt.UTC)
     row: dict[str, Any] = {
         "event": "linkedin_publish",
@@ -229,18 +235,47 @@ def write_receipt(cfg: Config, stage: str, post: Post | None = None, *,
         fh.write(json.dumps(row) + "\n")
 
 
-def load_placed_keys(cfg: Config) -> set[str]:
-    keys: set[str] = set()
+UNCERTAIN_STAGES = {"attempt", "uncertain"}
+
+
+def _receipt_rows(cfg: Config):
     if not cfg.receipts_dir.is_dir():
-        return keys
+        return
     for receipt_file in sorted(cfg.receipts_dir.glob("*.ndjson")):
         for line in receipt_file.read_text(encoding="utf-8").splitlines():
             if not line.strip():
                 continue
             try:
-                row = json.loads(line)
+                yield json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if row.get("stage") == "placed" and row.get("content_key"):
-                keys.add(row["content_key"])
-    return keys
+
+
+def load_states(cfg: Config) -> dict[str, str]:
+    """Latest outcome per content key, in the order the receipts were written.
+
+    'placed' is final: nothing that comes after it can make a post postable again.
+    'attempt' without an outcome after it means the run stopped while sending, which
+    counts as uncertain. 'stranded' is only a note and changes no outcome."""
+    states: dict[str, str] = {}
+    for row in _receipt_rows(cfg):
+        key, stage = row.get("content_key"), row.get("stage")
+        if not key or not stage or stage == "stranded":
+            continue
+        if states.get(key) == "placed":
+            continue
+        states[key] = stage
+    return states
+
+
+def load_placed_keys(cfg: Config) -> set[str]:
+    return {key for key, stage in load_states(cfg).items() if stage == "placed"}
+
+
+def load_uncertain_keys(cfg: Config) -> set[str]:
+    return {key for key, stage in load_states(cfg).items() if stage in UNCERTAIN_STAGES}
+
+
+def load_stranded_keys(cfg: Config) -> set[str]:
+    return {row["content_key"] for row in _receipt_rows(cfg)
+            if row.get("stage") == "stranded" and row.get("content_key")}

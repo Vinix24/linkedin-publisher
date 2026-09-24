@@ -204,11 +204,46 @@ def resolve_file(cfg: Config, raw: str) -> Path:
     return path.resolve()
 
 
-def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None) -> int:
+def warn_token_once_a_day(cfg: Config, now: dt.datetime, log) -> None:
+    """During the last week before the token expires, a scheduled run warns once a day."""
+    days = api.token_days_left(cfg, now)
+    if days is None or days > TOKEN_WARN_DAYS:
+        return
+    marker = cfg.heartbeat_file.with_name(".token-warned")
+    today = now.date().isoformat()
+    try:
+        if marker.exists() and marker.read_text(encoding="utf-8").strip() == today:
+            return
+        marker.write_text(today, encoding="utf-8")
+    except OSError:
+        pass
+    state = "has expired" if days <= 0 else f"expires in {days:.0f} days"
+    log(f"The LinkedIn token {state}. Run 'linkedin-publisher auth'.")
+    notify(f"LinkedIn token {state}", "Run: linkedin-publisher auth")
+
+
+def report_new_stranded(cfg: Config, skipped: list, log) -> int:
+    """A post that missed its slot is reported once, not on every run.
+    Returns 3 when there was something new to report, so a CI run turns red once."""
+    known = queue.load_stranded_keys(cfg)
+    new = [p for p in skipped if p.stranded
+           and queue.content_key(queue.post_text(p.body, cfg.notes_headings)) not in known]
+    for post in new:
+        queue.write_receipt(cfg, "stranded", post)
+        log(f"Missed its slot and was not posted late: {post.path.name}. "
+            "Give it a new slot or take it out of the queue.")
+        notify("LinkedIn post missed its slot", f"{post.path.stem} was not posted. You decide what happens.")
+    return 3 if new else 0
+
+
+def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None, retry: bool = False) -> int:
     """mode: dry (show) | notify (signal, never post) | post (post for real)."""
     log = make_log(cfg)
-    if mode == "notify" or (mode == "post" and only is None):
+    scheduled = mode == "notify" or (mode == "post" and only is None)
+    if scheduled:
         write_heartbeat(cfg, now)
+        warn_token_once_a_day(cfg, now, log)
+    stranded_code = 0
 
     if only is not None:
         if mode == "notify":
@@ -222,13 +257,18 @@ def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None) -> 
         key = queue.content_key(queue.post_text(post.body, cfg.notes_headings))
         if key in queue.load_placed_keys(cfg):
             raise api.PublisherError(f"{only.name}: a receipt shows this was already posted.")
+        if key in queue.load_uncertain_keys(cfg) and not retry:
+            raise api.PublisherError(f"{only.name}: an earlier attempt may have gone through. Check "
+                                     "LinkedIn. If the post is not there, add --retry.")
         post.due = now
     else:
-        ready, _skipped = queue.collect(cfg, now)
+        ready, skipped = queue.collect(cfg, now)
+        if mode in ("notify", "post"):
+            stranded_code = report_new_stranded(cfg, skipped, log)
         if not ready:
             if mode != "notify":
                 print("Nothing is due.")
-            return 0
+            return stranded_code
         post = ready[0]  # one post per run
         if len(ready) > 1:
             log(f"More than one post is due. Taking {post.path.name}, leaving "
@@ -237,7 +277,7 @@ def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None) -> 
     if mode == "notify":
         log(f"Due: {post.path.name} (slot {post.due:%Y-%m-%d %H:%M}). Waiting for a person to post it.")
         notify("LinkedIn post is due", f"{post.path.stem} is due. Run: linkedin-publisher publish --post")
-        return 0
+        return stranded_code
 
     text = queue.post_text(post.body, cfg.notes_headings)
     commentary = littletext.prepare(text)
@@ -265,10 +305,20 @@ def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None) -> 
             creds = api.load_credentials(cfg)
             tokens = api.ensure_access_token(cfg, creds, api.read_tokens(cfg), log)
             image = post.image if post.meta.get("format") == "image" else None
+            # Written before anything is sent. If the run dies while sending, the
+            # next run sees an attempt without an outcome and will not retry.
+            queue.write_receipt(cfg, "attempt", post)
             urn = api.publish(cfg, creds, tokens, commentary, image, post.meta.get("alt_text"))
         except api.PreflightRejected as exc:
             queue.write_receipt(cfg, "preflight-rejected", post, error=str(exc))
             log(f"Skipped by preflight: {post.path.name}: {exc}")
+            return 1
+        except api.PublishUncertain as exc:
+            queue.write_receipt(cfg, "uncertain", post, error=str(exc))
+            log(f"UNCLEAR: {post.path.name}: {exc} It will not be tried again automatically. "
+                "Check LinkedIn. If the post is not there, run: linkedin-publisher publish --post "
+                f"--file {post.path} --retry")
+            notify("LinkedIn post: unclear if it went out", f"Check LinkedIn before retrying {post.path.stem}.")
             return 1
         except Exception as exc:
             queue.write_receipt(cfg, "failed", post, error=str(exc))
@@ -276,8 +326,8 @@ def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None) -> 
 
         url = api.post_url_for(urn)
         log(f"Sent {len(commentary)} characters ({urn}).")
-        # The receipt is written before the file moves, so a failed move can
-        # never lead to posting the same text twice.
+        # Written before the file moves, so a failed move can never lead to
+        # posting the same text twice.
         queue.write_receipt(cfg, "placed", post, post_urn=urn, post_url=url)
         try:
             target = queue.move_to_published(post, cfg, url, now.date())
@@ -290,7 +340,7 @@ def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None) -> 
         log(f"Posted: {post.path.name} -> {url}")
         log(f"Moved to {target}")
         notify("LinkedIn post is live", f"{post.path.stem}. The first hour counts, answer comments.")
-        return 0
+        return stranded_code
     finally:
         cfg.lock_file.unlink(missing_ok=True)
 
@@ -328,6 +378,8 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--post", action="store_true", help="post for real")
     mode.add_argument("--notify", action="store_true", help="only signal that a post is due (for cron/launchd)")
     pub.add_argument("--file", help="post this file now, outside its slot")
+    pub.add_argument("--retry", action="store_true",
+                     help="with --file: try again after an unclear outcome, once you checked LinkedIn")
     return parser
 
 
@@ -355,7 +407,9 @@ def main(argv: list[str] | None = None) -> int:
         elif command == "publish":
             mode = "post" if args.post else "notify" if args.notify else "dry"
             only = resolve_file(cfg, args.file) if args.file else None
-            return cmd_publish(cfg, now, mode, only)
+            if args.retry and only is None:
+                raise api.PublisherError("--retry only works together with --file.")
+            return cmd_publish(cfg, now, mode, only, args.retry)
         return 0
     except (ConfigError, api.PublisherError, schedule.ScheduleError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

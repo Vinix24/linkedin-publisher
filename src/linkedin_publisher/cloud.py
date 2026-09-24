@@ -155,6 +155,7 @@ GITIGNORE = """\
 publisher.log
 schedule.log
 .last-check
+.token-warned
 """
 
 

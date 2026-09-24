@@ -27,9 +27,11 @@ shows exactly what will go out, without touching the network.
 of files with a `slot`, a `due` command that tells you what is ready, and an optional
 reminder every 15 minutes. The posting itself stays a deliberate step.
 
-**Posting twice is worse than not posting.** Every attempt is written to a local receipt
-file before anything else happens. If a post went live but its file could not be moved,
-the receipt still blocks a second attempt, even if you rename the file.
+**Posting twice is worse than not posting.** Every attempt leaves a local receipt: one just
+before the post is sent, one with the outcome, both before the file is moved. A post that
+went live is never offered again, not even after a failed move or a renamed file. And when
+LinkedIn's answer is unclear (a timeout, a server error, or a success without a post id),
+the tool does not try again by itself. It tells you to check LinkedIn first.
 
 ## What it does and does not do
 
@@ -59,7 +61,7 @@ A server that is always on (Hetzner, Google Cloud, a Raspberry Pi) is a third op
 
 **On your computer** it only runs while the computer is on and awake. A Mac that was asleep
 runs once when it wakes up. A post more than 90 minutes late is then not posted, on purpose:
-a post about this morning's news should not appear in the evening.
+a post about this morning's news should not appear in the evening. You get told once.
 
 **In GitHub Actions** there is no approval button at posting time. On GitHub Free, Pro and
 Team, required reviewers for workflow runs are only available in public repositories, and
@@ -162,13 +164,16 @@ linkedin-publisher check                # dry run over the whole queue: characte
 linkedin-publisher publish              # show exactly what would be sent
 linkedin-publisher publish --post       # post the next due post
 linkedin-publisher publish --post --file queue/2026-10-01-my-post.md   # post this one now
+linkedin-publisher publish --post --file queue/2026-10-01-my-post.md --retry
+                                        # only after an unclear outcome, once you checked LinkedIn
 ```
 
 One post per run. If two are due, it takes the first and tells you about the other.
 
-A post that missed its slot by more than 90 minutes is not posted late. You get a message
-instead, and you decide. Change `grace_minutes` in `publisher.toml` if you want a
-different window.
+A post that missed its slot by more than 90 minutes is not posted late. A scheduled run tells
+you once (a notification on your computer, a red run in GitHub Actions), and you decide:
+give it a new slot or take it out of the queue. `due` always shows it. Change
+`grace_minutes` in `publisher.toml` if you want a different window.
 
 ## Run it on your computer
 
@@ -181,6 +186,9 @@ linkedin-publisher schedule remove
 
 macOS uses launchd, Linux uses cron. On Windows, use Task Scheduler to run
 `linkedin-publisher publish --notify` every 15 minutes, or use GitHub Actions.
+
+Desktop notifications work on macOS and Linux. On Windows the message only goes to the log.
+During the last week before the token expires, a scheduled run warns you once a day.
 
 `schedule show` tells you when the last check ran. If that is more than 30 minutes ago, the
 computer was asleep or the job is gone. An empty log alone cannot tell you that.
@@ -287,6 +295,7 @@ sun = "11:00"
 | `426` when posting | LinkedIn retired the API version. Set `LINKEDIN_API_VERSION=YYYYMM` in `.env` to a current month. |
 | `preflight: REFUSED` | Something in the text is still unsafe. Run `check` to see what. |
 | "a receipt shows this was already posted" | The post is live. The file stayed behind. Move it by hand. |
+| "an earlier attempt may have gone through" | LinkedIn's answer was unclear. Look at your profile. If the post is not there, run the `--retry` command the message shows. If it is there, move the file to `published/`. |
 | GitHub Actions: "The job was not started because recent account payments have failed or your spending limit needs to be increased" | Actions in private repositories are blocked on your GitHub account. Nothing is posted until you fix it under *Settings, Billing and plans*. The run is red, so you will see it. |
 
 The files in `.receipts/` are a plain log of every attempt, one JSON line each.
