@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "linkedin-publisher"
-version = "0.2.2"
+version = "0.3.0"
 description = "Queue LinkedIn posts as Markdown files and publish them through the official API. A person presses the button."
 readme = "README.md"
 requires-python = ">=3.11"
