@@ -1,4 +1,4 @@
-"""Everything that talks to LinkedIn: OAuth, tokens, image upload, the post itself."""
+"""Everything that talks to LinkedIn: OAuth, tokens, image and video upload, the post itself."""
 from __future__ import annotations
 
 import datetime as dt
@@ -7,6 +7,7 @@ import json
 import os
 import secrets
 import threading
+import time
 import urllib.parse
 import webbrowser
 from pathlib import Path
@@ -21,6 +22,9 @@ TOKEN_URL = "https://www.linkedin.com/oauth/v2/accessToken"
 USERINFO_URL = "https://api.linkedin.com/v2/userinfo"
 POSTS_URL = "https://api.linkedin.com/rest/posts"
 IMAGES_URL = "https://api.linkedin.com/rest/images"
+VIDEOS_URL = "https://api.linkedin.com/rest/videos"
+VIDEO_READY_SECONDS = 15 * 60
+VIDEO_POLL_SECONDS = 5
 SCOPES = "openid profile w_member_social"
 
 Log = Callable[[str], None]
@@ -208,8 +212,8 @@ def ensure_access_token(cfg: Config, creds: dict[str, str], tokens: dict[str, An
 
 # ------------------------------------------------------------------------- posts
 
-def build_post_payload(author: str, commentary: str, image_urn: str | None = None,
-                       alt_text: str | None = None) -> dict[str, Any]:
+def build_post_payload(author: str, commentary: str, media_urn: str | None = None,
+                       alt_text: str | None = None, title: str | None = None) -> dict[str, Any]:
     """The JSON body for POST /rest/posts. Pure, so it can be tested."""
     payload: dict[str, Any] = {
         "author": author,
@@ -220,8 +224,13 @@ def build_post_payload(author: str, commentary: str, image_urn: str | None = Non
         "lifecycleState": "PUBLISHED",
         "isReshareDisabledByAuthor": False,
     }
-    if image_urn:
-        payload["content"] = {"media": {"id": image_urn, "altText": alt_text or ""}}
+    if media_urn and media_urn.startswith("urn:li:video:"):
+        media: dict[str, str] = {"id": media_urn}
+        if title:
+            media["title"] = title
+        payload["content"] = {"media": media}
+    elif media_urn:
+        payload["content"] = {"media": {"id": media_urn, "altText": alt_text or ""}}
     return payload
 
 
@@ -238,9 +247,69 @@ def upload_image(session: requests.Session, author: str, image_path: Path) -> st
     return str(value["image"])
 
 
+def upload_video(session: requests.Session, author: str, video_path: Path,
+                 videos_url: str = VIDEOS_URL, ready_seconds: int = VIDEO_READY_SECONDS,
+                 poll_seconds: float = VIDEO_POLL_SECONDS) -> str:
+    """Upload an MP4 and wait until LinkedIn has processed it. Returns the video URN.
+
+    LinkedIn hands out one upload URL per 4 MB part. Each part answers with an ETag,
+    and finalizeUpload needs those ETags in the same order. A post that points at a
+    video that is still processing is refused, so this waits for AVAILABLE. Nothing
+    is posted until this returns, so every failure here is a clean one."""
+    size = video_path.stat().st_size
+    init = session.post(f"{videos_url}?action=initializeUpload",
+                        json={"initializeUploadRequest": {"owner": author, "fileSizeBytes": size,
+                                                          "uploadCaptions": False,
+                                                          "uploadThumbnail": False}}, timeout=60)
+    if init.status_code not in (200, 201):
+        raise PublisherError(f"Starting the video upload failed ({init.status_code}): {init.text}")
+    value = init.json()["value"]
+    video_urn = str(value["video"])
+
+    part_ids: list[str] = []
+    with video_path.open("rb") as fh:
+        for number, part in enumerate(value["uploadInstructions"], start=1):
+            first, last = int(part["firstByte"]), int(part["lastByte"])
+            fh.seek(first)
+            put = requests.put(part["uploadUrl"], data=fh.read(last - first + 1),
+                               headers={"Content-Type": "application/octet-stream"}, timeout=300)
+            if put.status_code not in (200, 201):
+                raise PublisherError(f"Uploading video part {number} failed ({put.status_code}): {put.text}")
+            etag = put.headers.get("ETag", "").strip('"')
+            if not etag:
+                raise PublisherError(f"LinkedIn returned no ETag for video part {number}.")
+            part_ids.append(etag)
+
+    done = session.post(f"{videos_url}?action=finalizeUpload",
+                        json={"finalizeUploadRequest": {"video": video_urn,
+                                                        "uploadToken": value.get("uploadToken", ""),
+                                                        "uploadedPartIds": part_ids}}, timeout=60)
+    if done.status_code not in (200, 201):
+        raise PublisherError(f"Finishing the video upload failed ({done.status_code}): {done.text}")
+
+    status_url = f"{videos_url}/{urllib.parse.quote(video_urn, safe='')}"
+    deadline = time.monotonic() + ready_seconds
+    while True:
+        check = session.get(status_url, timeout=60)
+        if check.status_code != 200:
+            raise PublisherError(f"Could not read the video status ({check.status_code}): {check.text}")
+        info = check.json()
+        status = info.get("status")
+        if status == "AVAILABLE":
+            return video_urn
+        if status == "PROCESSING_FAILED":
+            reason = info.get("processingFailureReason") or "no reason given"
+            raise PublisherError(f"LinkedIn could not process the video: {reason}")
+        if time.monotonic() >= deadline:
+            raise PublisherError(f"The video was still {status} after {ready_seconds // 60} minutes. "
+                                 "Nothing was posted. Try again later.")
+        time.sleep(poll_seconds)
+
+
 def publish(cfg: Config, creds: dict[str, str], tokens: dict[str, Any], commentary: str,
             image: Path | None = None, alt_text: str | None = None,
-            posts_url: str = POSTS_URL) -> str:
+            posts_url: str = POSTS_URL, video: Path | None = None, title: str | None = None,
+            videos_url: str = VIDEOS_URL) -> str:
     """Post it. Returns the post URN."""
     from .littletext import find_unescaped
 
@@ -257,9 +326,15 @@ def publish(cfg: Config, creds: dict[str, str], tokens: dict[str, Any], commenta
         "Content-Type": "application/json",
     })
     author = tokens["author_urn"]
-    image_urn = upload_image(session, author, image) if image else None
+    if video and image:
+        raise PublisherError("A post carries an image or a video, not both.")
+    if video:
+        media_urn: str | None = upload_video(session, author, video, videos_url)
+    else:
+        media_urn = upload_image(session, author, image) if image else None
     try:
-        resp = session.post(posts_url, json=build_post_payload(author, commentary, image_urn, alt_text),
+        resp = session.post(posts_url,
+                            json=build_post_payload(author, commentary, media_urn, alt_text, title),
                             timeout=60)
     except requests.RequestException as exc:
         raise PublishUncertain(f"No clear answer from LinkedIn ({exc}). The post may be live.") from exc
