@@ -5,8 +5,10 @@ import threading
 import urllib.parse
 
 import pytest
+from conftest import WEDNESDAY_10, write_post
 
-from linkedin_publisher import api
+from linkedin_publisher import api, cli
+from linkedin_publisher import postqueue as queue
 
 CREDS = {"LINKEDIN_CLIENT_ID": "x", "LINKEDIN_CLIENT_SECRET": "y"}
 TOKENS = {"access_token": "t", "author_urn": "urn:li:person:x"}
@@ -157,3 +159,66 @@ def test_image_and_video_together_are_refused(cfg, tmp_path):
 def test_video_payload_has_no_alt_text_and_title_is_optional():
     payload = api.build_post_payload("urn:li:person:x", "Hi", VIDEO_URN, alt_text="ignored")
     assert payload["content"] == {"media": {"id": VIDEO_URN}}
+
+
+# ------------------------------------------------------------ queue and CLI
+
+VIDEO_META = {"status": "queued", "slot": "2026-09-23", "format": "video"}
+
+
+def queued_video(cfg, size=100_000, **extra):
+    path = write_post(cfg, "a.md", {**VIDEO_META, **extra})
+    path.with_suffix(".mp4").write_bytes(b"\0" * size)
+    return path
+
+
+def test_video_post_without_mp4_is_skipped(cfg):
+    write_post(cfg, "a.md", VIDEO_META)
+    ready, skipped = queue.collect(cfg, WEDNESDAY_10)
+    assert not ready and "no .mp4 file" in skipped[0].reason
+
+
+def test_video_outside_linkedins_size_limits_is_skipped(cfg):
+    queued_video(cfg, size=1_000)
+    _, skipped = queue.collect(cfg, WEDNESDAY_10)
+    assert "at least 75 KB" in skipped[0].reason
+
+
+def test_too_large_video_is_skipped_without_reading_it(cfg, monkeypatch):
+    queued_video(cfg)
+    monkeypatch.setattr(queue, "VIDEO_MAX_BYTES", 50_000)
+    _, skipped = queue.collect(cfg, WEDNESDAY_10)
+    assert "at most 500 MB" in skipped[0].reason
+
+
+def test_video_post_is_ready_and_moves_with_its_mp4(cfg):
+    path = queued_video(cfg)
+    ready, _ = queue.collect(cfg, WEDNESDAY_10)
+    assert [p.path for p in ready] == [path] and ready[0].video == path.with_suffix(".mp4")
+    queue.move_to_published(ready[0], cfg, "https://example.test/p", WEDNESDAY_10.date())
+    assert (cfg.published_dir / "a.mp4").exists() and not path.with_suffix(".mp4").exists()
+
+
+def test_publish_hands_the_video_and_title_to_the_api(cfg, tmp_path, monkeypatch, capsys):
+    path = queued_video(cfg, video_title="How it works")
+    sent = {}
+
+    def fake_publish(_cfg, _creds, _tokens, commentary, image=None, alt_text=None, **kwargs):
+        sent.update(image=image, **kwargs)
+        return "urn:li:share:9"
+
+    monkeypatch.setattr(api, "load_credentials", lambda _cfg: CREDS)
+    monkeypatch.setattr(api, "read_tokens", lambda _cfg: TOKENS)
+    monkeypatch.setattr(api, "ensure_access_token", lambda *_a: TOKENS)
+    monkeypatch.setattr(api, "publish", fake_publish)
+    code = cli.main(["--config", str(tmp_path / "publisher.toml"), "publish", "--post", "--file", str(path)])
+    assert code == 0, capsys.readouterr()
+    assert sent["image"] is None and sent["title"] == "How it works"
+    assert sent["video"].name == "a.mp4"
+    assert (cfg.published_dir / "a.mp4").exists()
+
+
+def test_dry_run_names_the_video(cfg, tmp_path, capsys):
+    path = queued_video(cfg, video_title="How it works")
+    cli.main(["--config", str(tmp_path / "publisher.toml"), "publish", "--file", str(path)])
+    assert "video: a.mp4 (0.1 MB, title: How it works)" in capsys.readouterr().out

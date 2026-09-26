@@ -239,6 +239,17 @@ def report_new_stranded(cfg: Config, skipped: list, log) -> int:
     return 3 if new else 0
 
 
+def media_line(post) -> str:
+    fmt = post.meta.get("format", "text")
+    if fmt == "video":
+        if not post.video:
+            return "video: none"
+        title = post.meta.get("video_title")
+        size = post.video.stat().st_size / (1024 * 1024)
+        return f"video: {post.video.name} ({size:.1f} MB{', title: ' + title if title else ''})"
+    return f"image: {post.image.name if post.image else 'none'}"
+
+
 def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None, retry: bool = False) -> int:
     """mode: dry (show) | notify (signal, never post) | post (post for real)."""
     log = make_log(cfg)
@@ -294,7 +305,7 @@ def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None, ret
     if mode == "dry":
         print(f"DRY RUN {post.path.name} (slot {post.due:%Y-%m-%d %H:%M})")
         print(f"characters: {len(commentary)} | format: {post.meta.get('format', 'text')} | "
-              f"image: {post.image.name if post.image else 'none'}")
+              f"{media_line(post)}")
         print("-" * 60)
         print(commentary)
         print("-" * 60)
@@ -314,10 +325,12 @@ def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None, ret
             creds = api.load_credentials(cfg)
             tokens = api.ensure_access_token(cfg, creds, api.read_tokens(cfg), log)
             image = post.image if post.meta.get("format") == "image" else None
+            video = post.video if post.meta.get("format") == "video" else None
             # Written before anything is sent. If the run dies while sending, the
             # next run sees an attempt without an outcome and will not retry.
             queue.write_receipt(cfg, "attempt", post)
-            urn = api.publish(cfg, creds, tokens, commentary, image, post.meta.get("alt_text"))
+            urn = api.publish(cfg, creds, tokens, commentary, image, post.meta.get("alt_text"),
+                              video=video, title=post.meta.get("video_title"))
         except api.PreflightRejected as exc:
             queue.write_receipt(cfg, "preflight-rejected", post, error=str(exc))
             log(f"Skipped by preflight: {post.path.name}: {exc}")
