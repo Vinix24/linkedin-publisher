@@ -15,6 +15,11 @@ from . import frontmatter, littletext
 from .config import TIME_RE, Config
 
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif")
+VIDEO_SUFFIXES = (".mp4",)
+# LinkedIn's limits for a feed video: MP4, 75 KB to 500 MB, 3 seconds to 30 minutes.
+# Size is checked here, before anything is sent. Length only LinkedIn can judge.
+VIDEO_MIN_BYTES = 75 * 1024
+VIDEO_MAX_BYTES = 500 * 1024 * 1024
 
 
 @dataclass
@@ -27,6 +32,7 @@ class Post:
     due: dt.datetime | None = None
     reason: str = ""
     stranded: bool = False
+    video: Path | None = None
 
 
 def find_image(md_path: Path) -> Path | None:
@@ -38,11 +44,20 @@ def find_image(md_path: Path) -> Path | None:
     return None
 
 
+def find_video(md_path: Path) -> Path | None:
+    """A video belongs to a post the same way an image does: post.md + post.mp4."""
+    for suffix in VIDEO_SUFFIXES:
+        candidate = md_path.with_suffix(suffix)
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def read_post(md_path: Path) -> Post:
     raw = md_path.read_text(encoding="utf-8")
     fm_lines, body = frontmatter.split(raw)
     return Post(path=md_path, meta=frontmatter.parse(fm_lines), body=body.strip(),
-                fm_lines=fm_lines, image=find_image(md_path))
+                fm_lines=fm_lines, image=find_image(md_path), video=find_video(md_path))
 
 
 def post_text(body: str, notes_headings: tuple[str, ...]) -> str:
@@ -91,6 +106,14 @@ def content_problem(post: Post, cfg: Config) -> str | None:
             return "format is image but there is no image file next to the post"
         if not post.meta.get("alt_text"):
             return "image without alt_text"
+    if post.meta.get("format") == "video":
+        if not post.video:
+            return "format is video but there is no .mp4 file next to the post"
+        size = post.video.stat().st_size
+        if size < VIDEO_MIN_BYTES:
+            return f"video is {size} bytes, LinkedIn needs at least 75 KB"
+        if size > VIDEO_MAX_BYTES:
+            return f"video is {size // (1024 * 1024)} MB, LinkedIn accepts at most 500 MB"
     leftover = littletext.find_unescaped(littletext.prepare(text))
     if leftover:
         return f"preflight refused: unescaped reserved character ({', '.join(sorted(set(leftover)))})"
@@ -223,8 +246,9 @@ def move_to_published(post: Post, cfg: Config, post_url: str, posted_on: dt.date
     target = _unique_target(cfg.published_dir, post.path.name)
     target.write_text(new_raw, encoding="utf-8")
     post.path.unlink()
-    if post.image:
-        shutil.move(str(post.image), str(_unique_target(cfg.published_dir, post.image.name)))
+    for media in (post.image, post.video):
+        if media:
+            shutil.move(str(media), str(_unique_target(cfg.published_dir, media.name)))
     return target
 
 
