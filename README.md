@@ -187,6 +187,10 @@ linkedin-publisher schedule remove
 macOS uses launchd, Linux uses cron. On Windows, use Task Scheduler to run
 `linkedin-publisher publish --notify` every 15 minutes, or use GitHub Actions.
 
+On macOS, a scheduled job may not read `~/Desktop` or `~/Documents` unless the Python that
+runs this tool has Full Disk Access (*System Settings, Privacy & Security*). Without it the
+run stops with "no permission to read the queue folder". Simpler: keep the queue elsewhere.
+
 Desktop notifications work on macOS and Linux. On Windows the message only goes to the log.
 During the last week before the token expires, a scheduled run warns you once a day.
 
@@ -293,6 +297,7 @@ sun = "11:00"
 | `403` when posting | *Share on LinkedIn* is not added to your app, or the app is not verified. |
 | `redirect_uri` error during `auth` | The redirect URL in the Auth tab must be exactly `http://localhost:8765/callback`. |
 | `426` when posting | LinkedIn retired the API version. Set `LINKEDIN_API_VERSION=YYYYMM` in `.env` to a current month. |
+| "no permission to read the queue folder" | A scheduled job on macOS may not look in `~/Desktop` or `~/Documents`. Give the Python behind `linkedin-publisher` Full Disk Access, or move the queue. |
 | `preflight: REFUSED` | Something in the text is still unsafe. Run `check` to see what. |
 | "a receipt shows this was already posted" | The post is live. The file stayed behind. Move it by hand. |
 | "an earlier attempt may have gone through" | LinkedIn's answer was unclear. Look at your profile. If the post is not there, run the `--retry` command the message shows. If it is there, move the file to `published/`. |

@@ -74,3 +74,32 @@ def test_publish_post_without_credentials_fails_cleanly_and_leaves_a_receipt(cfg
     assert rows[-1]["stage"] == "failed"
     assert (cfg.queue_dir / "a.md").exists()
     assert not cfg.lock_file.exists()
+
+
+def test_scheduled_run_on_unreadable_queue_fails_loudly(tmp_path, monkeypatch, capsys):
+    cli.main(["init", str(tmp_path)])
+    seen = []
+    monkeypatch.setattr(cli, "notify", lambda title, message: seen.append(title))
+
+    def refuse(path):
+        raise PermissionError(1, "Operation not permitted", str(path))
+
+    monkeypatch.setattr(cli.queue.os, "listdir", refuse)
+    code = cli.main(["--config", str(tmp_path / "publisher.toml"), "publish", "--post"])
+    err = capsys.readouterr().err
+    assert code == 1
+    assert "no permission to read the queue folder" in err
+    assert "Nothing is due" not in err
+    assert seen == ["LinkedIn queue unreadable"]
+
+
+def test_status_reports_unreadable_queue(tmp_path, monkeypatch, capsys):
+    cli.main(["init", str(tmp_path)])
+    capsys.readouterr()
+
+    def refuse(path):
+        raise PermissionError(1, "Operation not permitted", str(path))
+
+    monkeypatch.setattr(cli.queue.os, "listdir", refuse)
+    cli.main(["--config", str(tmp_path / "publisher.toml"), "status"])
+    assert "UNREADABLE" in capsys.readouterr().out

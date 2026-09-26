@@ -112,10 +112,13 @@ def cmd_init(target: Path, github: bool = False, tz_name: str | None = None) -> 
 
 
 def cmd_status(cfg: Config, online: bool = False, fail_days: int | None = None) -> int:
-    files = queue.queue_files(cfg) if cfg.queue_dir.exists() else []
+    try:
+        queue_state = f"{len(queue.queue_files(cfg))} posts"
+    except queue.QueueUnreadable as exc:
+        queue_state = f"UNREADABLE: {exc}"
     print(f"linkedin-publisher {__version__}")
     print(f"root:      {cfg.root}")
-    print(f"queue:     {cfg.queue_dir} ({len(files)} posts)")
+    print(f"queue:     {cfg.queue_dir} ({queue_state})")
     print(f"published: {cfg.published_dir}")
     print(f"receipts:  {cfg.receipts_dir} ({len(queue.load_placed_keys(cfg))} placed)")
     print(f"env file:  {cfg.env_file} ({'present' if cfg.env_file.exists() else 'MISSING'})")
@@ -262,7 +265,13 @@ def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None, ret
                                      "LinkedIn. If the post is not there, add --retry.")
         post.due = now
     else:
-        ready, skipped = queue.collect(cfg, now)
+        try:
+            ready, skipped = queue.collect(cfg, now)
+        except queue.QueueUnreadable as exc:
+            if scheduled:
+                log(f"Could not read the queue: {exc}")
+                notify("LinkedIn queue unreadable", "A scheduled run could not see the queue. See the log.")
+            raise
         if mode in ("notify", "post"):
             stranded_code = report_new_stranded(cfg, skipped, log)
         if not ready:
@@ -411,7 +420,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise api.PublisherError("--retry only works together with --file.")
             return cmd_publish(cfg, now, mode, only, args.retry)
         return 0
-    except (ConfigError, api.PublisherError, schedule.ScheduleError) as exc:
+    except (ConfigError, api.PublisherError, schedule.ScheduleError, queue.QueueUnreadable) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
     except requests.RequestException as exc:

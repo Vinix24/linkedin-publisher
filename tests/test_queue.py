@@ -1,6 +1,8 @@
 import datetime as dt
 import json
 
+import pytest
+
 from conftest import WEDNESDAY_10, write_post
 
 from linkedin_publisher import postqueue as queue
@@ -122,3 +124,29 @@ def test_move_never_overwrites(cfg):
     target = queue.move_to_published(queue.read_post(path), cfg, "u", dt.date(2026, 9, 23))
     assert target.name == "a-2.md"
     assert (cfg.published_dir / "a.md").read_text() == "an older post"
+
+
+def test_unreadable_queue_is_an_error_not_an_empty_queue(cfg, monkeypatch):
+    # macOS privacy protection: a launchd job without Full Disk Access gets a
+    # PermissionError on ~/Desktop, which Path.glob used to turn into "Nothing is due".
+    write_post(cfg, "a.md", {"status": "queued", "slot": "2026-09-23"})
+
+    def refuse(path):
+        raise PermissionError(1, "Operation not permitted", str(path))
+
+    monkeypatch.setattr(queue.os, "listdir", refuse)
+    with pytest.raises(queue.QueueUnreadable, match="Full Disk Access"):
+        queue.collect(cfg, WEDNESDAY_10)
+
+
+def test_missing_queue_folder_is_an_error(cfg):
+    cfg.queue_dir.rmdir()
+    with pytest.raises(queue.QueueUnreadable, match="not found"):
+        queue.queue_files(cfg)
+
+
+def test_queue_files_skips_readme_and_non_markdown(cfg):
+    write_post(cfg, "b.md", {"status": "queued"})
+    (cfg.queue_dir / "README.md").write_text("x", encoding="utf-8")
+    (cfg.queue_dir / "b.png").write_bytes(b"")
+    assert [p.name for p in queue.queue_files(cfg)] == ["b.md"]

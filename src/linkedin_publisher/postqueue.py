@@ -4,6 +4,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import os
 import re
 import shutil
 from dataclasses import dataclass
@@ -96,8 +97,28 @@ def content_problem(post: Post, cfg: Config) -> str | None:
     return None
 
 
+class QueueUnreadable(Exception):
+    """The queue folder is missing, or this process may not look inside it."""
+
+
 def queue_files(cfg: Config) -> list[Path]:
-    return sorted(p for p in cfg.queue_dir.glob("*.md") if p.name.lower() != "readme.md")
+    """The posts in the queue folder.
+
+    A folder that cannot be read is an error, never an empty queue. Path.glob swallows
+    the PermissionError, and on macOS a launchd job without Full Disk Access gets exactly
+    that for anything under ~/Desktop or ~/Documents. The run then reported "Nothing is
+    due" while a post was waiting (26-09-2026, 11:30)."""
+    try:
+        names = os.listdir(cfg.queue_dir)
+    except FileNotFoundError as exc:
+        raise QueueUnreadable(f"queue folder not found: {cfg.queue_dir}") from exc
+    except PermissionError as exc:
+        raise QueueUnreadable(
+            f"no permission to read the queue folder {cfg.queue_dir}. On macOS, give the Python "
+            "that runs this tool Full Disk Access, or move the queue out of Desktop and "
+            "Documents.") from exc
+    return sorted(cfg.queue_dir / n for n in names
+                  if n.endswith(".md") and n.lower() != "readme.md")
 
 
 def collect(cfg: Config, now: dt.datetime) -> tuple[list[Post], list[Post]]:
