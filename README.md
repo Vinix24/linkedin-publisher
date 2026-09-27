@@ -37,12 +37,13 @@ the tool does not try again by itself. It tells you to check LinkedIn first.
 
 | Supported | Not supported |
 |---|---|
-| Text posts | Video |
-| One image per post, with required alt text | Documents and PDF carousels |
-| Posting as yourself (your personal profile) | Several images in one post |
-| Markdown in your files (converted to plain text) | Polls |
-| Hashtags | Posting as a company page |
-| Private notes below the post that are never sent | Scheduling inside LinkedIn itself |
+| Text posts | Documents and PDF carousels |
+| One image per post, with required alt text | Several images in one post |
+| One MP4 video per post, up to 500 MB | Captions and a custom thumbnail for a video |
+| Posting as yourself (your personal profile) | Polls |
+| Markdown in your files (converted to plain text) | Posting as a company page |
+| Hashtags | Scheduling inside LinkedIn itself |
+| Private notes below the post that are never sent | |
 
 ## Read this before you start: scheduling needs something that runs
 
@@ -147,11 +148,19 @@ Anything below a line with only three dashes is private. It is never posted.
 | `slot` | yes | The date, `YYYY-MM-DD`. |
 | `slot_time` | no | `HH:MM`. Without it, the default time for that weekday from `publisher.toml` is used. |
 | `expires` | no | After this date the post is skipped, because it is no longer true. |
-| `format` | no | `text` (default) or `image`. |
+| `format` | no | `text` (default), `image` or `video`. |
 | `alt_text` | for images | Describes the image for people who cannot see it. |
+| `video_title` | no | Title of the video. |
 
 **Images:** put the image next to the post with the same name. `2026-10-01-my-post.md` goes
 with `2026-10-01-my-post.png` (or `.jpg`, `.jpeg`, `.gif`).
+
+**Videos:** the same pairing with an `.mp4`: `2026-10-01-my-post.mp4`, and `format: video`.
+LinkedIn accepts 75 KB to 500 MB and 3 seconds to 30 minutes. The size is checked before
+anything is sent. The tool uploads the video, waits until LinkedIn has processed it (up to
+15 minutes) and only then creates the post. If processing fails, nothing is posted and the
+reason is in the log. In GitHub Actions, keep videos under 100 MB: GitHub refuses larger
+files in a repository.
 
 Values follow YAML rules. A `# comment` after a value is ignored. Quote a value that has to
 contain ` #`.
