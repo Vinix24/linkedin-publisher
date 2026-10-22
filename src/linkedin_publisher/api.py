@@ -1,4 +1,4 @@
-"""Everything that talks to LinkedIn: OAuth, tokens, image and video upload, the post itself."""
+"""Everything that talks to LinkedIn: OAuth, tokens, image, video and document upload, the post itself."""
 from __future__ import annotations
 
 import datetime as dt
@@ -25,6 +25,9 @@ IMAGES_URL = "https://api.linkedin.com/rest/images"
 VIDEOS_URL = "https://api.linkedin.com/rest/videos"
 VIDEO_READY_SECONDS = 15 * 60
 VIDEO_POLL_SECONDS = 5
+DOCUMENTS_URL = "https://api.linkedin.com/rest/documents"
+DOCUMENT_READY_SECONDS = 10 * 60
+DOCUMENT_POLL_SECONDS = 5
 SCOPES = "openid profile w_member_social"
 
 Log = Callable[[str], None]
@@ -224,7 +227,7 @@ def build_post_payload(author: str, commentary: str, media_urn: str | None = Non
         "lifecycleState": "PUBLISHED",
         "isReshareDisabledByAuthor": False,
     }
-    if media_urn and media_urn.startswith("urn:li:video:"):
+    if media_urn and media_urn.startswith(("urn:li:video:", "urn:li:document:")):
         media: dict[str, str] = {"id": media_urn}
         if title:
             media["title"] = title
@@ -245,6 +248,29 @@ def upload_image(session: requests.Session, author: str, image_path: Path) -> st
     if put.status_code not in (200, 201):
         raise PublisherError(f"Uploading the image failed ({put.status_code}): {put.text}")
     return str(value["image"])
+
+
+def wait_until_available(session: requests.Session, status_url: str, kind: str,
+                         ready_seconds: int, poll_seconds: float) -> None:
+    """Poll a video or document until LinkedIn reports AVAILABLE.
+
+    PROCESSING_FAILED and a timeout both raise, before any post is created."""
+    deadline = time.monotonic() + ready_seconds
+    while True:
+        check = session.get(status_url, timeout=60)
+        if check.status_code != 200:
+            raise PublisherError(f"Could not read the {kind} status ({check.status_code}): {check.text}")
+        info = check.json()
+        status = info.get("status")
+        if status == "AVAILABLE":
+            return
+        if status == "PROCESSING_FAILED":
+            reason = info.get("processingFailureReason") or "no reason given"
+            raise PublisherError(f"LinkedIn could not process the {kind}: {reason}")
+        if time.monotonic() >= deadline:
+            raise PublisherError(f"The {kind} was still {status} after {ready_seconds // 60} minutes. "
+                                 "Nothing was posted. Try again later.")
+        time.sleep(poll_seconds)
 
 
 def upload_video(session: requests.Session, author: str, video_path: Path,
@@ -287,29 +313,41 @@ def upload_video(session: requests.Session, author: str, video_path: Path,
     if done.status_code not in (200, 201):
         raise PublisherError(f"Finishing the video upload failed ({done.status_code}): {done.text}")
 
-    status_url = f"{videos_url}/{urllib.parse.quote(video_urn, safe='')}"
-    deadline = time.monotonic() + ready_seconds
-    while True:
-        check = session.get(status_url, timeout=60)
-        if check.status_code != 200:
-            raise PublisherError(f"Could not read the video status ({check.status_code}): {check.text}")
-        info = check.json()
-        status = info.get("status")
-        if status == "AVAILABLE":
-            return video_urn
-        if status == "PROCESSING_FAILED":
-            reason = info.get("processingFailureReason") or "no reason given"
-            raise PublisherError(f"LinkedIn could not process the video: {reason}")
-        if time.monotonic() >= deadline:
-            raise PublisherError(f"The video was still {status} after {ready_seconds // 60} minutes. "
-                                 "Nothing was posted. Try again later.")
-        time.sleep(poll_seconds)
+    wait_until_available(session, f"{videos_url}/{urllib.parse.quote(video_urn, safe='')}",
+                         "video", ready_seconds, poll_seconds)
+    return video_urn
+
+
+def upload_document(session: requests.Session, author: str, document_path: Path,
+                    documents_url: str = DOCUMENTS_URL, ready_seconds: int = DOCUMENT_READY_SECONDS,
+                    poll_seconds: float = DOCUMENT_POLL_SECONDS) -> str:
+    """Upload a PDF and wait until LinkedIn has processed it. Returns the document URN.
+
+    One upload URL for the whole file, the way an image goes up. LinkedIn then turns
+    the pages into the carousel people swipe through. This waits for AVAILABLE, so a
+    post never points at a document that failed. Nothing is posted until this
+    returns, so every failure here is a clean one."""
+    init = session.post(f"{documents_url}?action=initializeUpload",
+                        json={"initializeUploadRequest": {"owner": author}}, timeout=60)
+    if init.status_code not in (200, 201):
+        raise PublisherError(f"Starting the document upload failed ({init.status_code}): {init.text}")
+    value = init.json()["value"]
+    document_urn = str(value["document"])
+    put = requests.put(value["uploadUrl"], data=document_path.read_bytes(),
+                       headers={"Authorization": session.headers["Authorization"]}, timeout=300)
+    if put.status_code not in (200, 201):
+        raise PublisherError(f"Uploading the document failed ({put.status_code}): {put.text}")
+
+    wait_until_available(session, f"{documents_url}/{urllib.parse.quote(document_urn, safe='')}",
+                         "document", ready_seconds, poll_seconds)
+    return document_urn
 
 
 def publish(cfg: Config, creds: dict[str, str], tokens: dict[str, Any], commentary: str,
             image: Path | None = None, alt_text: str | None = None,
             posts_url: str = POSTS_URL, video: Path | None = None, title: str | None = None,
-            videos_url: str = VIDEOS_URL) -> str:
+            videos_url: str = VIDEOS_URL, document: Path | None = None,
+            documents_url: str = DOCUMENTS_URL) -> str:
     """Post it. Returns the post URN."""
     from .littletext import find_unescaped
 
@@ -326,10 +364,12 @@ def publish(cfg: Config, creds: dict[str, str], tokens: dict[str, Any], commenta
         "Content-Type": "application/json",
     })
     author = tokens["author_urn"]
-    if video and image:
-        raise PublisherError("A post carries an image or a video, not both.")
+    if len([media for media in (image, video, document) if media]) > 1:
+        raise PublisherError("A post carries one image, one video or one document, never two of them.")
     if video:
         media_urn: str | None = upload_video(session, author, video, videos_url)
+    elif document:
+        media_urn = upload_document(session, author, document, documents_url)
     else:
         media_urn = upload_image(session, author, image) if image else None
     try:

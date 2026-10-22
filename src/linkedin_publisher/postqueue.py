@@ -20,6 +20,11 @@ VIDEO_SUFFIXES = (".mp4",)
 # Size is checked here, before anything is sent. Length only LinkedIn can judge.
 VIDEO_MIN_BYTES = 75 * 1024
 VIDEO_MAX_BYTES = 500 * 1024 * 1024
+DOCUMENT_SUFFIXES = (".pdf",)
+# LinkedIn's limits for a document post: PDF, up to 100 MB and 300 pages. Size is
+# checked here, before anything is sent. Pages only LinkedIn can judge: counting them
+# would need a PDF library.
+DOCUMENT_MAX_BYTES = 100 * 1024 * 1024
 
 
 @dataclass
@@ -33,6 +38,7 @@ class Post:
     reason: str = ""
     stranded: bool = False
     video: Path | None = None
+    document: Path | None = None
 
 
 def find_image(md_path: Path) -> Path | None:
@@ -53,11 +59,21 @@ def find_video(md_path: Path) -> Path | None:
     return None
 
 
+def find_document(md_path: Path) -> Path | None:
+    """A PDF belongs to a post the same way an image does: post.md + post.pdf."""
+    for suffix in DOCUMENT_SUFFIXES:
+        candidate = md_path.with_suffix(suffix)
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def read_post(md_path: Path) -> Post:
     raw = md_path.read_text(encoding="utf-8")
     fm_lines, body = frontmatter.split(raw)
     return Post(path=md_path, meta=frontmatter.parse(fm_lines), body=body.strip(),
-                fm_lines=fm_lines, image=find_image(md_path), video=find_video(md_path))
+                fm_lines=fm_lines, image=find_image(md_path), video=find_video(md_path),
+                document=find_document(md_path))
 
 
 def post_text(body: str, notes_headings: tuple[str, ...]) -> str:
@@ -114,6 +130,16 @@ def content_problem(post: Post, cfg: Config) -> str | None:
             return f"video is {size} bytes, LinkedIn needs at least 75 KB"
         if size > VIDEO_MAX_BYTES:
             return f"video is {size // (1024 * 1024)} MB, LinkedIn accepts at most 500 MB"
+    if post.meta.get("format") == "document":
+        if not post.document:
+            return "format is document but there is no .pdf file next to the post"
+        if not post.meta.get("document_title"):
+            return "document without document_title"
+        size = post.document.stat().st_size
+        if size == 0:
+            return "document is an empty file"
+        if size > DOCUMENT_MAX_BYTES:
+            return f"document is {size // (1024 * 1024)} MB, LinkedIn accepts at most 100 MB"
     leftover = littletext.find_unescaped(littletext.prepare(text))
     if leftover:
         return f"preflight refused: unescaped reserved character ({', '.join(sorted(set(leftover)))})"
@@ -246,7 +272,7 @@ def move_to_published(post: Post, cfg: Config, post_url: str, posted_on: dt.date
     target = _unique_target(cfg.published_dir, post.path.name)
     target.write_text(new_raw, encoding="utf-8")
     post.path.unlink()
-    for media in (post.image, post.video):
+    for media in (post.image, post.video, post.document):
         if media:
             shutil.move(str(media), str(_unique_target(cfg.published_dir, media.name)))
     return target
