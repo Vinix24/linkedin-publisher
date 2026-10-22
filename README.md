@@ -37,12 +37,13 @@ the tool does not try again by itself. It tells you to check LinkedIn first.
 
 | Supported | Not supported |
 |---|---|
-| Text posts | Documents and PDF carousels |
-| One image per post, with required alt text | Several images in one post |
-| One MP4 video per post, up to 500 MB | Captions and a custom thumbnail for a video |
-| Posting as yourself (your personal profile) | Polls |
-| Markdown in your files (converted to plain text) | Posting as a company page |
-| Hashtags | Scheduling inside LinkedIn itself |
+| Text posts | Several images in one post |
+| One image per post, with required alt text | Captions and a custom thumbnail for a video |
+| One MP4 video per post, up to 500 MB | Polls |
+| One PDF per post (a document or carousel), up to 100 MB and 300 pages | Posting as a company page |
+| Posting as yourself (your personal profile) | Scheduling inside LinkedIn itself |
+| Markdown in your files (converted to plain text) | |
+| Hashtags | |
 | Private notes below the post that are never sent | |
 
 ## Read this before you start: scheduling needs something that runs
@@ -148,9 +149,10 @@ Anything below a line with only three dashes is private. It is never posted.
 | `slot` | yes | The date, `YYYY-MM-DD`. |
 | `slot_time` | no | `HH:MM`. Without it, the default time for that weekday from `publisher.toml` is used. |
 | `expires` | no | After this date the post is skipped, because it is no longer true. |
-| `format` | no | `text` (default), `image` or `video`. |
+| `format` | no | `text` (default), `image`, `video` or `document`. |
 | `alt_text` | for images | Describes the image for people who cannot see it. |
 | `video_title` | no | Title of the video. |
+| `document_title` | for documents | Title LinkedIn shows above the document. |
 
 **Images:** put the image next to the post with the same name. `2026-10-01-my-post.md` goes
 with `2026-10-01-my-post.png` (or `.jpg`, `.jpeg`, `.gif`).
@@ -161,6 +163,13 @@ anything is sent. The tool uploads the video, waits until LinkedIn has processed
 15 minutes) and only then creates the post. If processing fails, nothing is posted and the
 reason is in the log. In GitHub Actions, keep videos under 100 MB: GitHub refuses larger
 files in a repository.
+
+**Documents:** the same pairing with a `.pdf`: `2026-10-01-my-post.pdf`, `format: document`
+and a `document_title`. PDF only: export a Word or PowerPoint file to PDF first. LinkedIn
+accepts up to 100 MB and 300 pages. The size is checked before anything is sent. The page
+count only LinkedIn can judge. The tool uploads the PDF, waits until LinkedIn has processed it
+(up to 10 minutes) and only then creates the post. If processing fails, nothing is posted and
+the reason is in the log.
 
 Values follow YAML rules. A `# comment` after a value is ignored. Quote a value that has to
 contain ` #`.
