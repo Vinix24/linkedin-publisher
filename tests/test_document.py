@@ -5,8 +5,10 @@ import threading
 import urllib.parse
 
 import pytest
+from conftest import WEDNESDAY_10, write_post
 
-from linkedin_publisher import api
+from linkedin_publisher import api, cli
+from linkedin_publisher import postqueue as queue
 
 CREDS = {"LINKEDIN_CLIENT_ID": "x", "LINKEDIN_CLIENT_SECRET": "y"}
 TOKENS = {"access_token": "t", "author_urn": "urn:li:person:x"}
@@ -143,3 +145,95 @@ def test_document_payload_has_a_title_and_no_alt_text():
     payload = api.build_post_payload("urn:li:person:x", "Hi", DOCUMENT_URN,
                                      alt_text="ignored", title="Five lessons")
     assert payload["content"] == {"media": {"id": DOCUMENT_URN, "title": "Five lessons"}}
+
+
+# ------------------------------------------------------------ queue and CLI
+
+DOCUMENT_META = {"status": "queued", "slot": "2026-09-23", "format": "document"}
+
+
+def queued_document(cfg, size=20_000, **extra):
+    path = write_post(cfg, "a.md", {**DOCUMENT_META, "document_title": "Five lessons", **extra})
+    path.with_suffix(".pdf").write_bytes(b"\0" * size)
+    return path
+
+
+def test_document_post_without_pdf_is_skipped(cfg):
+    write_post(cfg, "a.md", {**DOCUMENT_META, "document_title": "Five lessons"})
+    ready, skipped = queue.collect(cfg, WEDNESDAY_10)
+    assert not ready and "no .pdf file" in skipped[0].reason
+
+
+def test_document_post_without_document_title_is_skipped(cfg):
+    path = write_post(cfg, "a.md", DOCUMENT_META)
+    path.with_suffix(".pdf").write_bytes(b"%PDF-1.7")
+    ready, skipped = queue.collect(cfg, WEDNESDAY_10)
+    assert not ready and skipped[0].reason == "document without document_title"
+
+
+def test_empty_pdf_is_skipped(cfg):
+    queued_document(cfg, size=0)
+    _, skipped = queue.collect(cfg, WEDNESDAY_10)
+    assert skipped[0].reason == "document is an empty file"
+
+
+def test_too_large_pdf_is_skipped_without_reading_it(cfg, monkeypatch):
+    queued_document(cfg)
+    monkeypatch.setattr(queue, "DOCUMENT_MAX_BYTES", 10_000)
+    _, skipped = queue.collect(cfg, WEDNESDAY_10)
+    assert "at most 100 MB" in skipped[0].reason
+
+
+def test_document_post_is_ready_and_moves_with_its_pdf(cfg):
+    path = queued_document(cfg)
+    ready, _ = queue.collect(cfg, WEDNESDAY_10)
+    assert [p.path for p in ready] == [path] and ready[0].document == path.with_suffix(".pdf")
+    queue.move_to_published(ready[0], cfg, "https://example.test/p", WEDNESDAY_10.date())
+    assert (cfg.published_dir / "a.pdf").exists() and not path.with_suffix(".pdf").exists()
+
+
+def fake_api(monkeypatch):
+    sent = {}
+
+    def fake_publish(_cfg, _creds, _tokens, commentary, image=None, alt_text=None, **kwargs):
+        sent.update(image=image, **kwargs)
+        return "urn:li:share:9"
+
+    monkeypatch.setattr(api, "load_credentials", lambda _cfg: CREDS)
+    monkeypatch.setattr(api, "read_tokens", lambda _cfg: TOKENS)
+    monkeypatch.setattr(api, "ensure_access_token", lambda *_a: TOKENS)
+    monkeypatch.setattr(api, "publish", fake_publish)
+    monkeypatch.setattr(cli, "notify", lambda *_a: None)
+    return sent
+
+
+def test_publish_hands_the_document_and_title_to_the_api(cfg, tmp_path, monkeypatch, capsys):
+    path = queued_document(cfg, video_title="not this one")
+    sent = fake_api(monkeypatch)
+    code = cli.main(["--config", str(tmp_path / "publisher.toml"), "publish", "--post", "--file", str(path)])
+    assert code == 0, capsys.readouterr()
+    assert sent["image"] is None and sent["video"] is None
+    assert sent["document"].name == "a.pdf" and sent["title"] == "Five lessons"
+    assert (cfg.published_dir / "a.pdf").exists()
+
+
+def test_pdf_next_to_a_text_post_is_not_sent(cfg, tmp_path, monkeypatch, capsys):
+    path = write_post(cfg, "a.md", {"status": "queued", "slot": "2026-09-23"})
+    path.with_suffix(".pdf").write_bytes(b"%PDF-1.7")
+    sent = fake_api(monkeypatch)
+    code = cli.main(["--config", str(tmp_path / "publisher.toml"), "publish", "--post", "--file", str(path)])
+    assert code == 0, capsys.readouterr()
+    assert sent["document"] is None
+
+
+def test_dry_run_names_the_document(cfg, tmp_path, capsys):
+    path = queued_document(cfg, size=300_000)
+    cli.main(["--config", str(tmp_path / "publisher.toml"), "publish", "--file", str(path)])
+    assert "format: document | document: a.pdf (0.3 MB, title: Five lessons)" in capsys.readouterr().out
+
+
+def test_check_refuses_a_document_without_title(cfg, tmp_path, capsys):
+    path = write_post(cfg, "a.md", DOCUMENT_META)
+    path.with_suffix(".pdf").write_bytes(b"%PDF-1.7")
+    cli.main(["--config", str(tmp_path / "publisher.toml"), "check"])
+    assert "preflight: REFUSED, document without document_title" in capsys.readouterr().out

@@ -241,12 +241,13 @@ def report_new_stranded(cfg: Config, skipped: list, log) -> int:
 
 def media_line(post) -> str:
     fmt = post.meta.get("format", "text")
-    if fmt == "video":
-        if not post.video:
-            return "video: none"
-        title = post.meta.get("video_title")
-        size = post.video.stat().st_size / (1024 * 1024)
-        return f"video: {post.video.name} ({size:.1f} MB{', title: ' + title if title else ''})"
+    if fmt in ("video", "document"):
+        media = post.video if fmt == "video" else post.document
+        if not media:
+            return f"{fmt}: none"
+        title = post.meta.get(f"{fmt}_title")
+        size = media.stat().st_size / (1024 * 1024)
+        return f"{fmt}: {media.name} ({size:.1f} MB{', title: ' + title if title else ''})"
     return f"image: {post.image.name if post.image else 'none'}"
 
 
@@ -326,11 +327,13 @@ def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None, ret
             tokens = api.ensure_access_token(cfg, creds, api.read_tokens(cfg), log)
             image = post.image if post.meta.get("format") == "image" else None
             video = post.video if post.meta.get("format") == "video" else None
+            document = post.document if post.meta.get("format") == "document" else None
+            title = post.meta.get("document_title") if document else post.meta.get("video_title")
             # Written before anything is sent. If the run dies while sending, the
             # next run sees an attempt without an outcome and will not retry.
             queue.write_receipt(cfg, "attempt", post)
             urn = api.publish(cfg, creds, tokens, commentary, image, post.meta.get("alt_text"),
-                              video=video, title=post.meta.get("video_title"))
+                              video=video, title=title, document=document)
         except api.PreflightRejected as exc:
             queue.write_receipt(cfg, "preflight-rejected", post, error=str(exc))
             log(f"Skipped by preflight: {post.path.name}: {exc}")
