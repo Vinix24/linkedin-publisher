@@ -152,7 +152,7 @@ def test_part_without_etag_cannot_be_finalized(cfg, tmp_path):
 def test_image_and_video_together_are_refused(cfg, tmp_path):
     image = tmp_path / "a.png"
     image.write_bytes(b"x")
-    with pytest.raises(api.PublisherError, match="not both"):
+    with pytest.raises(api.PublisherError, match="never two"):
         FakeLinkedIn().publish(cfg, make_video(tmp_path, 100_000), image=image)
 
 
