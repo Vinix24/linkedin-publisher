@@ -393,9 +393,10 @@ def test_a_number_changed_after_a_send_attempt_would_allow_a_second_post(metered
     assert measure(metered) == 0                       # the guard: measure leaves it alone
     assert path.read_bytes() == before and metered.meter.calls() == 0
 
-    path.write_bytes(changed)                          # what an unguarded write would have caused
-    ready, _skipped = queue.collect(metered.cfg, SLOT_PLUS_5)
-    assert [p.path.name for p in ready] == ["a.md"]
+    path.write_bytes(changed)                          # a hand edit: measure itself never writes here
+    ready, skipped = queue.collect(metered.cfg, SLOT_PLUS_5)
+    assert ready == [] and [p.path.name for p in skipped] == ["a.md"]      # the claim still names the file
+    assert "left a claim" in skipped[0].reason
 
 
 def test_the_slot_arriving_while_the_command_runs_stops_the_write(metered):
@@ -439,6 +440,122 @@ def test_a_person_editing_while_the_command_runs_wins(metered, monkeypatch):
     text = path.read_text()
     assert "An edited intro." in text and "There are 53 items" in text
     assert [p.name for p in metered.cfg.queue_dir.iterdir()] == ["a.md"]
+
+
+# ------------------------------------- a hand edit of the digits after an unclear send attempt
+
+def _unclear(setup, monkeypatch):
+    setup.install_fake_linkedin(monkeypatch, fail_with=api.PublishUncertain("timeout"))
+    assert run_scheduled(setup) == 1
+    assert setup.receipt_stages() == ["attempt", "uncertain"]
+
+
+def _crash(setup, monkeypatch):
+    setup.install_fake_linkedin(monkeypatch, fail_with=KeyboardInterrupt())
+    with pytest.raises(KeyboardInterrupt):
+        run_scheduled(setup)
+    assert setup.receipt_stages() == ["attempt"]
+
+
+def _placed_but_not_moved(setup, monkeypatch):
+    setup.install_fake_linkedin(monkeypatch)
+
+    def broken_move(*_args, **_kwargs):
+        raise OSError("disk is read-only")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(queue, "move_to_published", broken_move)
+        assert run_scheduled(setup) == 1
+    assert setup.receipt_stages() == ["attempt", "placed", "move-failed"]
+    assert len(setup.sends) == 1
+
+
+EARLIER_ATTEMPTS = {"unclear": _unclear, "crash": _crash, "placed-but-not-moved": _placed_but_not_moved}
+
+
+@pytest.fixture(params=sorted(EARLIER_ATTEMPTS))
+def edited_by_hand(request, metered, monkeypatch):
+    """An approved measure post that a scheduled run claimed and could not finish, whose digits a
+    person then changed by hand. That edit keeps the approval and gives the text a new identity:
+    no receipt and no claim knows it. Returns (setup, path of the post)."""
+    path = measured_post(metered)
+    assert approve(metered) == 0
+    EARLIER_ATTEMPTS[request.param](metered, monkeypatch)
+    replace_in(path, "There are 53", "There are 49")
+    metered.install_fake_linkedin(monkeypatch)          # LinkedIn answers again
+    return metered, path
+
+
+def test_a_digits_only_edit_keeps_the_approval_and_leaves_the_new_text_unknown(edited_by_hand):
+    setup, path = edited_by_hand
+    post = queue.read_post(path)
+    new_key = queue.content_key(queue.post_text(post.body, setup.cfg.notes_headings))
+    assert approval.check(post, setup.cfg)[0] == approval.APPROVED
+    assert new_key not in queue.load_states(setup.cfg) and not claims.exists(setup.cfg, new_key)
+    assert claims.held_for_file(setup.cfg, "a.md")
+
+
+def test_a_scheduled_run_sends_nothing_after_a_digits_only_edit(edited_by_hand, capsys):
+    setup, _path = edited_by_hand
+    sent, stages = len(setup.sends), setup.receipt_stages()
+    ready, skipped = queue.collect(setup.cfg, SLOT_PLUS_5)
+    assert ready == [] and [p.path.name for p in skipped] == ["a.md"]
+    reason = skipped[0].reason
+    assert "earlier attempt" in reason and "claim" in reason and "Check LinkedIn" in reason
+    assert f"publish --post --file {setup.cfg.queue_dir / 'a.md'} --retry" in reason
+    capsys.readouterr()
+    assert run_scheduled(setup) == 0
+    assert len(setup.sends) == sent
+    assert setup.receipt_stages() == stages
+    assert "Nothing is due." in capsys.readouterr().out
+
+
+def test_file_without_retry_sends_nothing_after_a_digits_only_edit(edited_by_hand, capsys):
+    setup, path = edited_by_hand
+    sent, stages = len(setup.sends), setup.receipt_stages()
+    assert setup.run("publish", "--post", "--file", str(path)) == 1
+    err = capsys.readouterr().err
+    assert "a.md" in err and "claim" in err and "Check LinkedIn" in err and "--retry" in err
+    assert len(setup.sends) == sent and setup.receipt_stages() == stages
+    assert path.exists() and not setup.cfg.lock_file.exists()
+
+
+def test_file_with_retry_is_the_way_out_after_a_digits_only_edit(edited_by_hand):
+    setup, path = edited_by_hand
+    sent = len(setup.sends)
+    assert setup.run("publish", "--post", "--file", str(path), "--retry") == 0
+    assert len(setup.sends) == sent + 1 and "There are 49 items left." in setup.sends[-1]["commentary"]
+    assert setup.receipt_stages()[-2:] == ["attempt", "placed"]
+    assert (setup.cfg.published_dir / "a.md").exists() and not path.exists()
+
+
+def test_a_claim_naming_another_file_does_not_hold_a_measure_post(metered):
+    measured_post(metered)
+    approve(metered)
+    assert claims.take(metered.cfg, "9" * 64, "other.md")
+    ready, skipped = queue.collect(metered.cfg, SLOT_PLUS_5)
+    assert [p.path.name for p in ready] == ["a.md"] and skipped == []
+    assert run_scheduled(metered) == 0
+    assert len(metered.sends) == 1 and "There are 53" in metered.sends[0]["commentary"]
+
+
+@pytest.mark.parametrize("meta", [{"measure": "count"}, {"measure_line": ""}], ids=["measure-only", "empty-line"])
+def test_a_post_without_a_measure_line_is_not_held_by_a_claim_on_its_file(metered, meta):
+    metered.post("a.md", meta, body=BODY)
+    approve(metered)
+    assert claims.take(metered.cfg, "9" * 64, "a.md")                  # another text, same file name
+    assert [p.path.name for p in queue.collect(metered.cfg, SLOT_PLUS_5)[0]] == ["a.md"]
+    assert run_scheduled(metered) == 0
+    assert len(metered.sends) == 1
+
+
+def test_measure_and_the_scheduled_run_still_work_for_a_post_nothing_was_tried_with(metered):
+    measured_post(metered)
+    approve(metered)
+    assert measure(metered) == 0
+    assert "There are 49 items left." in (metered.cfg.queue_dir / "a.md").read_text()
+    assert run_scheduled(metered) == 0
+    assert "There are 49 items left." in metered.sends[0]["commentary"]
 
 
 # ----------------------------------------------------------- measure: when it fails

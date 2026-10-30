@@ -187,6 +187,8 @@ def approval_note(cfg: Config, post) -> str:
     """Only when approval is required: whether a scheduled run would post this one."""
     if not cfg.approval_required:
         return ""
+    if approval.is_external(post, cfg):
+        return "  [external route]"
     state, _current = approval.check(post, cfg)
     if state == approval.MISMATCH and approval.measure_line_problem(post, cfg):
         return "  [measure line does not match]"
@@ -343,10 +345,15 @@ MEASURE_LINE_NOTICE = ("LinkedIn post: measure line does not match",
 def apply_approval(cfg: Config, ready: list, log) -> tuple[list, int]:
     """Keep the due posts whose approval matches what would go out now. Every other one is
     reported once per version, with a note in the receipts, and left alone.
+    A post on an external route (see ``approval.is_external``) is none of this tool's business: it
+    is not sent, and it gets no note and no notification, only a line in the log.
     Returns (posts to send, 3 when there was something new to report)."""
     noted = {stage: queue.load_notes(cfg, stage) for stage, _title, _text in APPROVAL_NOTICES.values()}
     send, reported = [], 0
     for post in ready:
+        if approval.is_external(post, cfg):
+            log(f"{post.path.name} runs through another route. Leaving it to that route.")
+            continue
         try:
             state, current = approval.check(post, cfg)
         except OSError as exc:
@@ -414,14 +421,18 @@ def media_line(post) -> str:
     return f"image: {post.image.name if post.image else 'none'}"
 
 
-def held_back_line(unapproved: int, failing_checks: int) -> str:
+def held_back_line(unapproved: int, failing_checks: int, external: int = 0) -> str:
     reasons = []
     if unapproved:
         reasons.append(f"{unapproved} without a valid approval")
     if failing_checks:
         reasons.append(f"{failing_checks} with a failing check")
     if not reasons:
+        if external:
+            return f"Nothing to post here: {external} due post(s) run through another route."
         return "Nothing is due."
+    if external:
+        reasons.append(f"{external} on another route")
     return f"Nothing can be posted: due post(s), {', '.join(reasons)}. See 'linkedin-publisher due' and the log."
 
 
@@ -474,6 +485,9 @@ def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None, ret
         if key in queue.load_uncertain_keys(cfg) and not retry:
             raise api.PublisherError(f"{only.name}: an earlier attempt may have gone through. Check "
                                      "LinkedIn. If the post is not there, add --retry.")
+        if not retry and queue.held_by_earlier_attempt(cfg, post):
+            raise api.PublisherError(f"{only.name}: an earlier attempt of this post left a claim. It may have "
+                                     "gone through. Check LinkedIn. If the post is not there, add --retry.")
         post.due = now
     else:
         try:
@@ -486,20 +500,21 @@ def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None, ret
         if mode in ("notify", "post"):
             report_code = report_new_stranded(cfg, skipped, log)
             report_code = report_unresolved_claims(cfg, now, log) or report_code
-        unapproved_count = check_held = 0
+        unapproved_count = check_held = external_count = 0
         if mode == "post" and cfg.approval_required:
             # Before anything is sent: a due post goes out only when a person approved this version.
             due_count = len(ready)
+            external_count = sum(approval.is_external(post, cfg) for post in ready)
             ready, unapproved = apply_approval(cfg, ready, log)
             report_code = report_code or unapproved
-            unapproved_count = due_count - len(ready)
+            unapproved_count = due_count - len(ready) - external_count
         if mode == "post":
             # After the approval and before the claim: the addresses the post names must answer.
             ready, check_held, failed_checks = apply_checks(cfg, ready, log)
             report_code = report_code or failed_checks
         if not ready:
             if mode != "notify":
-                print(held_back_line(unapproved_count, check_held))
+                print(held_back_line(unapproved_count, check_held, external_count))
             return report_code
         post = ready[0]  # one post per run
         if len(ready) > 1:

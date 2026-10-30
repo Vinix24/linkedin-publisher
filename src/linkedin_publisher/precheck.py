@@ -41,13 +41,6 @@ class PostReport:
         return self.route != EXTERNAL
 
 
-def is_external(post: queue.Post, cfg: Config) -> bool:
-    """A post whose route field holds the configured text runs somewhere else, outside this tool."""
-    if not cfg.external_route_field or not cfg.external_route_text:
-        return False
-    return cfg.external_route_text in post.meta.get(cfg.external_route_field, "")
-
-
 def evaluate(cfg: Config, now: dt.datetime, days_ahead: int) -> list[PostReport]:
     """A report for every queued post whose slot lies between now and the end of the day
     ``days_ahead`` days from today. Posts already past their slot and posts a receipt shows as
@@ -67,7 +60,7 @@ def evaluate(cfg: Config, now: dt.datetime, days_ahead: int) -> list[PostReport]
         state = states.get(key)
         if state == "placed":
             continue
-        if is_external(post, cfg):
+        if approval.is_external(post, cfg):
             reports.append(PostReport(post, slot, EXTERNAL))
             continue
         reports.append(PostReport(post, slot, PUBLISHER, problems_of(cfg, post, slot, key, state)))

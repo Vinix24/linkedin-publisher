@@ -10,6 +10,7 @@ from linkedin_publisher import postqueue as queue
 
 NOW = dt.datetime(2026, 9, 22, 17, 0)               # the evening before the slot
 NEXT_MORNING = dt.datetime(2026, 9, 23, 8, 0)
+SLOT_PLUS_5 = dt.datetime(2026, 9, 23, 10, 5)
 TOML = """\
 [approval]
 required = true
@@ -22,11 +23,19 @@ timeout_seconds = 5
 REQUIRED_ONLY = "[approval]\nrequired = true\n"
 TITLE_PRECHECK = "LinkedIn precheck: a post will not go out as planned"
 JSON_POST_KEYS = {"post", "slot_date", "slot_time", "route", "checked", "problems"}
+ROUTE = {"route_note": '"This one runs via a cron in a session"'}
 
 
 @pytest.fixture
 def ready(tmp_path):
     return Setup(tmp_path, TOML)
+
+
+@pytest.fixture
+def publishing(tmp_path, monkeypatch):
+    setup = Setup(tmp_path, TOML)
+    setup.install_fake_linkedin(monkeypatch)
+    return setup
 
 
 def block(*lines: str) -> str:
@@ -45,6 +54,10 @@ def approved_post(setup: Setup, name: str = "a.md", meta: dict | None = None, bo
 
 def precheck(setup: Setup, now: dt.datetime = NOW, days_ahead: int = 1, as_json: bool = False) -> int:
     return cli.cmd_precheck(setup.cfg, now, days_ahead, as_json)
+
+
+def run_scheduled(setup: Setup, now: dt.datetime = SLOT_PLUS_5) -> int:
+    return cli.cmd_publish(setup.cfg, now, "post", None)
 
 
 def report(capsys) -> dict:
@@ -264,6 +277,140 @@ def test_without_an_external_route_in_the_config_nothing_is_external(tmp_path, c
     setup.post("a.md", {"route_note": '"this runs via a cron"'})
     assert precheck(setup, as_json=True) == 3
     assert report(capsys)["posts"][0]["route"] == "publisher"
+
+
+# ------------------------------------------------ an approval in the file means this tool is the route
+
+def test_an_approved_post_that_still_carries_the_route_text_is_checked_as_the_publisher(ready, site, capsys):
+    bad = site.serve("/bad", status=500)
+    good = site.serve("/good", "ok")
+    approved_post(ready, "a.md", {**ROUTE, "checks": block(bad)}, body="One.")
+    approved_post(ready, "b.md", {**ROUTE, "checks": block(good)}, body="Two.")
+    assert precheck(ready, as_json=True) == 3
+    data = report(capsys)
+    assert {p["post"]: (p["route"], p["checked"]) for p in data["posts"]} == \
+        {"a.md": ("publisher", True), "b.md": ("publisher", True)}
+    assert kinds(data, "a.md") == ["check-failed"] and kinds(data, "b.md") == []
+    assert sorted(site.hits) == ["/bad", "/good"]
+    assert ready.titles() == [TITLE_PRECHECK]
+
+
+def test_an_approved_post_with_the_route_text_is_not_reported_as_external_in_the_text_output(ready, capsys):
+    approved_post(ready, meta=ROUTE)
+    assert precheck(ready) == 0
+    out = capsys.readouterr().out
+    assert "ok" in out and "external" not in out
+
+
+def test_a_mismatched_approval_on_a_post_with_the_route_text_is_reported(ready, capsys):
+    path = approved_post(ready, meta=ROUTE)
+    path.write_text(path.read_text().replace("Hello world.", "Hello, world."))
+    assert precheck(ready, as_json=True) == 3
+    data = report(capsys)
+    assert (data["posts"][0]["route"], data["posts"][0]["checked"]) == ("publisher", True)
+    assert kinds(data) == ["approval-mismatch"]
+
+
+def test_a_key_alone_next_to_the_route_text_still_means_the_tool_is_the_route(ready, capsys):
+    ready.post("a.md", {**ROUTE, "approved_key": '"' + "0" * 64 + '"'})
+    assert precheck(ready, as_json=True) == 3
+    data = report(capsys)
+    assert data["posts"][0]["route"] == "publisher" and kinds(data) == ["approval-missing"]
+
+
+def test_an_empty_key_is_no_approval_and_the_post_stays_external(ready, capsys):
+    ready.post("a.md", {**ROUTE, "approved_key": '""'})
+    assert precheck(ready, as_json=True) == 0
+    assert report(capsys)["posts"][0]["route"] == "external"
+
+
+def test_an_approval_with_another_key_field_name_counts_too(tmp_path, capsys):
+    setup = Setup(tmp_path, TOML, frontmatter='approved_key_field = "signed_off_key"\n')
+    approved_post(setup, meta=ROUTE)
+    assert "signed_off_key" in (setup.cfg.queue_dir / "a.md").read_text()
+    assert precheck(setup, as_json=True) == 0
+    assert report(capsys)["posts"][0]["route"] == "publisher"
+
+
+# ------------------------------------------- a scheduled run and a post on the external route
+
+def test_a_scheduled_run_leaves_posts_on_the_external_route_alone_without_any_alert(publishing, capsys):
+    for index, slot_time in enumerate(("09:00", "09:30", "10:00")):
+        publishing.post(f"cron{index}.md", {**ROUTE, "slot_time": f'"{slot_time}"'}, body=f"Runs elsewhere {index}.")
+    assert run_scheduled(publishing) == 0
+    assert run_scheduled(publishing) == 0
+    assert publishing.sends == []
+    assert publishing.notifications() == [] and publishing.receipt_stages() == []
+    assert not (publishing.cfg.receipts_dir / "claims").exists()
+    out = capsys.readouterr().out
+    assert "another route" in out and "approv" not in out
+    log = publishing.cfg.log_file.read_text()
+    assert all(f"cron{index}.md" in log for index in range(3)) and "another route" in log
+    assert all((publishing.cfg.queue_dir / f"cron{index}.md").exists() for index in range(3))
+
+
+def test_an_external_post_does_not_hold_up_an_approved_post_in_the_same_run(publishing):
+    publishing.post("cron.md", {**ROUTE, "slot_time": '"09:00"'}, body="Runs elsewhere.")
+    approved_post(publishing, "b.md", {"slot_time": '"09:30"'}, body="Approved.")
+    assert run_scheduled(publishing) == 0
+    assert [s["commentary"] for s in publishing.sends] == ["Approved."]
+    assert publishing.titles() == ["LinkedIn post is live"]
+    assert publishing.receipt_stages() == ["attempt", "placed"]
+    assert (publishing.cfg.queue_dir / "cron.md").exists()
+
+
+def test_an_approved_post_that_carries_the_route_text_is_sent(publishing):
+    approved_post(publishing, meta=ROUTE)
+    assert run_scheduled(publishing) == 0
+    assert [s["commentary"] for s in publishing.sends] == ["Hello world."]
+    assert publishing.titles() == ["LinkedIn post is live"]
+
+
+def test_a_mismatched_approval_on_a_post_with_the_route_text_is_held_and_reported(publishing):
+    path = approved_post(publishing, meta=ROUTE)
+    path.write_text(path.read_text().replace("Hello world.", "Hello, world."))
+    assert run_scheduled(publishing) == 3
+    assert publishing.sends == []
+    assert publishing.titles() == ["LinkedIn post: approval belongs to a different version"]
+    assert publishing.receipt_stages() == ["approval-mismatch"]
+
+
+def test_the_held_back_line_does_not_count_an_external_post_as_unapproved(publishing, capsys):
+    publishing.post("cron.md", {**ROUTE, "slot_time": '"09:00"'}, body="Runs elsewhere.")
+    assert run_scheduled(publishing) == 0
+    assert "1 due post(s) run through another route" in capsys.readouterr().out
+    publishing.post("b.md", {"slot_time": '"09:30"'}, body="Not approved.")
+    assert run_scheduled(publishing) == 3
+    out = capsys.readouterr().out
+    assert "1 without a valid approval" in out and "1 on another route" in out
+    assert publishing.titles() == ["LinkedIn post needs approval"]        # b.md only
+
+
+def test_with_nothing_due_the_run_still_says_so(publishing, capsys):
+    assert run_scheduled(publishing) == 0
+    assert "Nothing is due." in capsys.readouterr().out
+
+
+def test_due_and_the_dry_run_mark_a_post_on_the_external_route(publishing, capsys):
+    external = publishing.post("cron.md", ROUTE, body="Runs elsewhere.")
+    approved_post(publishing, "b.md", ROUTE, body="Approved here.")
+    publishing.post("c.md", {}, body="Nobody looked at this.")
+    cli.cmd_due(publishing.cfg, SLOT_PLUS_5)
+    out = capsys.readouterr().out
+    assert "  cron.md  (slot 2026-09-23 10:00, text)  [external route]" in out
+    assert "  b.md  (slot 2026-09-23 10:00, text)  [approved]" in out
+    assert "  c.md  (slot 2026-09-23 10:00, text)  [not approved]" in out
+    assert cli.cmd_publish(publishing.cfg, SLOT_PLUS_5, "dry", external) == 0
+    out = capsys.readouterr().out
+    assert "DRY RUN cron.md" in out and "[external route]" in out and "not approved" not in out
+
+
+def test_without_required_approval_the_note_stays_empty(tmp_path, capsys):
+    setup = Setup(tmp_path, '[approval]\nexternal_route_field = "route_note"\n'
+                            'external_route_text = "runs via a cron"\n')
+    setup.post("cron.md", ROUTE)
+    cli.cmd_due(setup.cfg, SLOT_PLUS_5)
+    assert "external route" not in capsys.readouterr().out
 
 
 # ------------------------------------------------------------------- which posts are looked at

@@ -404,6 +404,15 @@ claim knows, and it could go out a second time. So `measure` leaves a post alone
 | a receipt shows it as placed | |
 | a receipt shows it as uncertain, or an attempt without an outcome | |
 
+`measure` refuses to write the number in these cases. It cannot stop a person from editing the digits
+by hand, and a digits-only edit keeps the approval. So the other commands hold such a post: when any
+claim names the file of a post that has a `measure_line`, a scheduled run skips it and
+`publish --file` stops, both with a message that points at LinkedIn and at `--retry`. That covers an
+earlier attempt that left a claim behind: an unclear outcome, a crash, or a post that went live and
+could not be moved. Look at your profile first. If the post is not there,
+`publish --post --file <the post> --retry` sends it. Posts without a `measure_line` are judged by
+their text alone, as before.
+
 If the measurement fails (the command exits non-zero, runs too long, prints nothing the pattern
 finds, or prints two things it finds) the post keeps its last number and still goes out. You get
 one notification per post and reason (`measure-failed`). The pattern has to find exactly one number
@@ -508,9 +517,15 @@ external_route_text = "runs via a cron"   # a post whose field contains this tex
 
 Such a post is shown as `route: external, not checked` (`"route": "external", "checked": false` in
 the JSON), with no problem and no notification. It stays visible on purpose: it still hangs on
-something else. The text is matched exactly, capitals included. This only changes `precheck`. A
-scheduled `publish --post` treats the post like any other, so with approval required it still
-reports that the post has no approval when its slot comes.
+something else. The text is matched exactly, capitals included.
+
+A post counts as external only while the file has no `approved_key`. An approval in the file means
+this tool is the route: `precheck` checks the post in full, an approval for a different version is
+reported as `approval-mismatch`, and a scheduled run sends it when the approval is valid.
+
+With approval required, a scheduled `publish --post` leaves an external post alone as well. It does
+not send it, writes no note in the receipts and sends no notification. It writes one line to the log
+(`runs through another route`), and `due` and the dry run show `[external route]` next to it.
 
 Run `measure` and `precheck` from the scheduler you already use. They are plain commands:
 
@@ -649,7 +664,7 @@ grace_minutes = 90
 
 [approval]
 required = true                        # default false: nothing changes for existing setups
-external_route_field = "note"          # default none; posts marked this way are shown, not checked by precheck
+external_route_field = "note"          # default none; posts marked this way and without approved_key are left to their own route
 external_route_text = "runs via a cron"
 
 [claims]

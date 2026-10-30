@@ -91,6 +91,20 @@ def check(post: queue.Post, cfg: Config) -> tuple[str, str]:
     return (APPROVED if stored == current else MISMATCH), current
 
 
+def is_external(post: queue.Post, cfg: Config) -> bool:
+    """A post runs somewhere else, outside this tool, when its route field holds the configured
+    text and the file carries no approval key.
+
+    An approval in the file means this tool is the route: the post is checked in full and a scheduled
+    run sends it, also when that approval is for a different version (a mismatch is news, not a
+    reason to look away). Without the configured text nothing is external."""
+    if not cfg.external_route_field or not cfg.external_route_text:
+        return False
+    if post.meta.get(cfg.approved_key_field):
+        return False
+    return cfg.external_route_text in post.meta.get(cfg.external_route_field, "")
+
+
 def measure_line_problem(post: queue.Post, cfg: Config) -> str | None:
     """Why the measure line of this post cannot take part in an approval, or None."""
     try:
