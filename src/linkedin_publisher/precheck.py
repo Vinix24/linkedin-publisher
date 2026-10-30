@@ -92,7 +92,7 @@ def problems_of(cfg: Config, post: queue.Post, slot: dt.datetime, key: str, stat
         except ValueError:
             pass
 
-    if state in queue.UNCERTAIN_STAGES or claims.exists(cfg, key):
+    if state in queue.UNCERTAIN_STAGES or claims.exists(cfg, key) or queue.held_by_earlier_attempt(cfg, post):
         problems.append(Problem(
             "blocked", "a scheduled run will not send it: an earlier attempt may have gone through, or a "
                        "claim exists. Check LinkedIn. If the post is not there: "

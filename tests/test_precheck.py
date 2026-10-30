@@ -447,6 +447,19 @@ def test_a_claim_or_an_unclear_attempt_that_stops_the_post_is_a_problem(ready, c
     assert kinds(data, "a.md") == ["blocked"] and kinds(data, "b.md") == ["blocked"]
 
 
+def test_a_measure_post_whose_file_a_claim_names_under_another_key_is_blocked(ready, capsys):
+    meta = {"measure": "count", "measure_line": '"There are {n} items left."'}
+    approved_post(ready, "a.md", meta, body="There are 49 items left.")           # edited by hand after the attempt
+    claims.take(ready.cfg, queue.content_key("There are 53 items left."), "a.md")
+    approved_post(ready, "b.md", body="No measure line.")
+    claims.take(ready.cfg, queue.content_key("Some earlier text."), "b.md")
+    assert precheck(ready, as_json=True) == 3
+    data = report(capsys)
+    assert kinds(data, "a.md") == ["blocked"] and kinds(data, "b.md") == []
+    assert "--retry" in problems(data, "a.md")[0]["message"] and "a.md" in problems(data, "a.md")[0]["message"]
+    assert ready.titles() == [TITLE_PRECHECK]
+
+
 # ------------------------------------------------------------------------------ json
 
 def test_the_json_has_a_stable_shape(ready, capsys):
