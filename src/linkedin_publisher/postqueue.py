@@ -347,7 +347,8 @@ def write_receipt(cfg: Config, stage: str, post: Post | None = None, *,
 
 UNCERTAIN_STAGES = {"attempt", "uncertain"}
 # Notes tell a person something once. They are not outcomes and must never stand in for one.
-NOTE_STAGES = frozenset({"stranded", "approval-missing", "approval-mismatch", "claim-unresolved"})
+NOTE_STAGES = frozenset({"stranded", "approval-missing", "approval-mismatch", "claim-unresolved",
+                         "measured", "measure-failed", "check-failed", "precheck"})
 
 
 def _receipt_rows(cfg: Config):

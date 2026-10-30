@@ -559,7 +559,12 @@ def test_a_claim_without_content_is_read_by_its_age(setup):
 
 # ------------------------------------------------- notes never mask an outcome
 
-NOTES = ["stranded", "approval-missing", "approval-mismatch", "claim-unresolved"]
+NOTES = ["stranded", "approval-missing", "approval-mismatch", "claim-unresolved",
+         "measured", "measure-failed", "check-failed", "precheck"]
+
+
+def test_every_note_stage_is_covered_by_the_tests_below():
+    assert set(NOTES) == set(queue.NOTE_STAGES)
 
 
 @pytest.mark.parametrize("note", NOTES)
