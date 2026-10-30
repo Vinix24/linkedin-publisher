@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import frontmatter, littletext
+from . import claims, frontmatter, littletext
 from .config import TIME_RE, Config
 
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif")
@@ -69,11 +69,37 @@ def find_document(md_path: Path) -> Path | None:
 
 
 def read_post(md_path: Path) -> Post:
-    raw = md_path.read_text(encoding="utf-8")
+    return parse_post(md_path, md_path.read_text(encoding="utf-8"))
+
+
+def parse_post(md_path: Path, raw: str) -> Post:
     fm_lines, body = frontmatter.split(raw)
     return Post(path=md_path, meta=frontmatter.parse(fm_lines), body=body.strip(),
                 fm_lines=fm_lines, image=find_image(md_path), video=find_video(md_path),
                 document=find_document(md_path))
+
+
+@dataclass
+class Outgoing:
+    """The parts of a post that are handed to LinkedIn, decided by its format."""
+    image: Path | None
+    video: Path | None
+    document: Path | None
+    title: str | None
+    alt_text: str | None
+
+
+def outgoing(post: Post) -> Outgoing:
+    """A file next to a post that its format does not use is never sent. Posting and the
+    approval key both read this, so they cannot disagree about what goes out."""
+    fmt = post.meta.get("format")
+    document = post.document if fmt == "document" else None
+    return Outgoing(
+        image=post.image if fmt == "image" else None,
+        video=post.video if fmt == "video" else None,
+        document=document,
+        title=post.meta.get("document_title") if document else post.meta.get("video_title"),
+        alt_text=post.meta.get("alt_text"))
 
 
 def post_text(body: str, notes_headings: tuple[str, ...]) -> str:
@@ -196,6 +222,13 @@ def collect(cfg: Config, now: dt.datetime) -> tuple[list[Post], list[Post]]:
             skipped.append(post)
             continue
 
+        if claims.exists(cfg, content_key(post_text(post.body, cfg.notes_headings))):
+            post.reason = ("a claim exists: another run is sending it, or an earlier run ended without "
+                           "an outcome. Check LinkedIn. If the post is not there: "
+                           f"linkedin-publisher publish --post --file {post.path} --retry")
+            skipped.append(post)
+            continue
+
         status = post.meta.get("status")
         if status != cfg.ready_status:
             post.reason = f"status is {status or 'empty'}, not {cfg.ready_status}"
@@ -286,27 +319,37 @@ def move_to_published(post: Post, cfg: Config, post_url: str, posted_on: dt.date
 
 def write_receipt(cfg: Config, stage: str, post: Post | None = None, *,
                   post_urn: str | None = None, post_url: str | None = None,
-                  error: str | None = None) -> None:
+                  error: str | None = None, key: str | None = None, file_name: str | None = None,
+                  ref: str | None = None) -> None:
     """Append-only NDJSON, one file per day.
 
-    stage: attempt | placed | uncertain | failed | preflight-rejected | move-failed | stranded"""
+    stage: attempt | placed | uncertain | failed | preflight-rejected | move-failed | one of
+    NOTE_STAGES. Without a post, key and file_name say which post it is about (a claim has
+    no post file to read). ref says which version of the subject a note is about, so a note
+    is written once per version and not once per run."""
     now = dt.datetime.now(dt.UTC)
     row: dict[str, Any] = {
         "event": "linkedin_publish",
         "stage": stage,
-        "file": post.path.name if post else None,
-        "content_key": content_key(post_text(post.body, cfg.notes_headings)) if post else None,
+        "file": post.path.name if post else file_name,
+        "content_key": content_key(post_text(post.body, cfg.notes_headings)) if post else key,
         "timestamp": now.isoformat(),
         "post_urn": post_urn,
         "post_url": post_url,
         "error": error,
     }
+    if ref is not None:
+        row["ref"] = ref
     cfg.receipts_dir.mkdir(parents=True, exist_ok=True)
     with (cfg.receipts_dir / f"{now:%Y-%m-%d}.ndjson").open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(row) + "\n")
 
 
 UNCERTAIN_STAGES = {"attempt", "uncertain"}
+# Nothing more can come of these: the post went out, or it is known that nothing was sent.
+RESOLVED_STAGES = {"placed", "failed", "preflight-rejected"}
+# Notes tell a person something once. They are not outcomes and must never stand in for one.
+NOTE_STAGES = frozenset({"stranded", "approval-missing", "approval-mismatch", "claim-unresolved"})
 
 
 def _receipt_rows(cfg: Config):
@@ -327,11 +370,11 @@ def load_states(cfg: Config) -> dict[str, str]:
 
     'placed' is final: nothing that comes after it can make a post postable again.
     'attempt' without an outcome after it means the run stopped while sending, which
-    counts as uncertain. 'stranded' is only a note and changes no outcome."""
+    counts as uncertain. A note (NOTE_STAGES) changes no outcome."""
     states: dict[str, str] = {}
     for row in _receipt_rows(cfg):
         key, stage = row.get("content_key"), row.get("stage")
-        if not key or not stage or stage == "stranded":
+        if not key or not stage or stage in NOTE_STAGES:
             continue
         if states.get(key) == "placed":
             continue
@@ -350,3 +393,9 @@ def load_uncertain_keys(cfg: Config) -> set[str]:
 def load_stranded_keys(cfg: Config) -> set[str]:
     return {row["content_key"] for row in _receipt_rows(cfg)
             if row.get("stage") == "stranded" and row.get("content_key")}
+
+
+def load_notes(cfg: Config, stage: str) -> set[tuple[str, str]]:
+    """(content key, ref) of every note of this stage that was already written."""
+    return {(row["content_key"], row.get("ref") or "") for row in _receipt_rows(cfg)
+            if row.get("stage") == stage and row.get("content_key")}

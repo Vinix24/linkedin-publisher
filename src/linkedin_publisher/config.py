@@ -11,6 +11,10 @@ WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 CONFIG_ENV = "LINKEDIN_PUBLISHER_CONFIG"
 DEFAULT_CONFIG_NAME = "publisher.toml"
 TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
+FIELD_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
+# Names the tool itself reads or writes in a post file. An approval field must not be one of them.
+RESERVED_FIELDS = {"status", "slot", "slot_time", "format", "alt_text", "video_title",
+                   "document_title", "posted_date", "linkedin_url"}
 
 
 class ConfigError(Exception):
@@ -37,6 +41,12 @@ class Config:
     redirect_port: int = 8765
     api_version: str = "202606"
     config_path: Path | None = None
+    approval_required: bool = False
+    approved_by_field: str = "approved_by"
+    approved_at_field: str = "approved_at"
+    approved_key_field: str = "approved_key"
+    claim_unresolved_minutes: int = 15
+    notify_command: tuple[str, ...] = ()
 
 
 def find_config(explicit: str | None) -> Path | None:
@@ -54,6 +64,33 @@ def _check_time(value: str, where: str) -> str:
     if not TIME_RE.match(value):
         raise ConfigError(f"{where}: '{value}' is not a time in HH:MM format")
     return value
+
+
+def _field_names(fm: dict, expires_key: str) -> tuple[str, str, str]:
+    """The three frontmatter fields that record an approval."""
+    names = []
+    for option, default in (("approved_by_field", "approved_by"), ("approved_at_field", "approved_at"),
+                            ("approved_key_field", "approved_key")):
+        name = fm.get(option, default)
+        if not isinstance(name, str) or not FIELD_RE.match(name):
+            raise ConfigError(f"frontmatter.{option} must be a plain field name, not {name!r}")
+        if name in RESERVED_FIELDS or name == expires_key:
+            raise ConfigError(f"frontmatter.{option}: '{name}' is a field the tool uses itself")
+        names.append(name)
+    if len(set(names)) != 3:
+        raise ConfigError("frontmatter: approved_by_field, approved_at_field and approved_key_field "
+                          "must be three different names")
+    return names[0], names[1], names[2]
+
+
+def _notify_command(data: dict) -> tuple[str, ...]:
+    if "command" not in data:
+        return ()
+    command = data["command"]
+    if not isinstance(command, list) or not command or not all(isinstance(a, str) and a for a in command):
+        raise ConfigError("notify.command must be a non-empty list of strings, "
+                          'for example ["/path/to/script"]')
+    return tuple(command)
 
 
 def load_config(explicit: str | None = None) -> Config:
@@ -87,6 +124,16 @@ def load_config(explicit: str | None = None) -> Config:
     if not isinstance(headings, list) or not all(isinstance(h, str) for h in headings):
         raise ConfigError("frontmatter.notes_headings must be a list of strings")
 
+    approval = data.get("approval", {})
+    required = approval.get("required", False)
+    if not isinstance(required, bool):
+        raise ConfigError("approval.required must be true or false")
+    unresolved = data.get("claims", {}).get("unresolved_minutes", 15)
+    if isinstance(unresolved, bool) or not isinstance(unresolved, int) or unresolved < 1:
+        raise ConfigError("claims.unresolved_minutes must be a whole number of minutes, at least 1")
+    expires_key = str(fm.get("expires_key", "expires"))
+    by_field, at_field, key_field = _field_names(fm, expires_key)
+
     return Config(
         root=root,
         queue_dir=resolve("queue", "queue"),
@@ -99,11 +146,17 @@ def load_config(explicit: str | None = None) -> Config:
         heartbeat_file=resolve("heartbeat_file", ".last-check"),
         ready_status=str(fm.get("ready_status", "queued")),
         published_status=str(fm.get("published_status", "published")),
-        expires_key=str(fm.get("expires_key", "expires")),
+        expires_key=expires_key,
         notes_headings=tuple(headings),
         slot_times=slot_times,
         grace_minutes=int(slots.get("grace_minutes", 90)),
         redirect_port=int(data.get("auth", {}).get("redirect_port", 8765)),
         api_version=str(data.get("api", {}).get("version", "202606")),
         config_path=path.resolve() if path is not None else None,
+        approval_required=required,
+        approved_by_field=by_field,
+        approved_at_field=at_field,
+        approved_key_field=key_field,
+        claim_unresolved_minutes=unresolved,
+        notify_command=_notify_command(data.get("notify", {})),
     )

@@ -5,16 +5,18 @@ import argparse
 import datetime as dt
 import json
 import platform
+import shlex
 import subprocess
 import sys
 from pathlib import Path
 
 import requests
 
-from . import __version__, api, cloud, littletext, postqueue as queue, schedule, templates
+from . import __version__, api, approval, claims, cloud, littletext, postqueue as queue, schedule, templates
 from .config import DEFAULT_CONFIG_NAME, Config, ConfigError, load_config
 
 TOKEN_WARN_DAYS = 7
+NOTIFY_HOOK_TIMEOUT = 30
 
 
 def make_log(cfg: Config):
@@ -42,6 +44,30 @@ def notify(title: str, message: str) -> None:
             subprocess.run(["notify-send", title, message], check=False, capture_output=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
         pass
+
+
+def alert(cfg: Config, title: str, message: str) -> None:
+    """A notification for a person: the desktop one, and the [notify] command when there is one.
+
+    The command is for a job that no desktop is watching. It gets title and message as its last
+    two arguments and runs without a shell. Whatever goes wrong with it is logged and goes no
+    further, because a run that found something to report must still do its work."""
+    notify(title, message)
+    if not cfg.notify_command:
+        return
+    try:
+        result = subprocess.run([*cfg.notify_command, title, message], check=False, capture_output=True,
+                                stdin=subprocess.DEVNULL, timeout=NOTIFY_HOOK_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        failure = f"timed out after {NOTIFY_HOOK_TIMEOUT} seconds"
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        failure = str(exc)
+    else:
+        if result.returncode == 0:
+            return
+        said = result.stderr.decode("utf-8", "replace").strip()[:200]
+        failure = f"exit code {result.returncode}" + (f": {said}" if said else "")
+    make_log(cfg)(f"The notification hook failed ({failure}): {cfg.notify_command[0]}")
 
 
 def write_heartbeat(cfg: Config, now: dt.datetime) -> None:
@@ -139,7 +165,8 @@ def cmd_due(cfg: Config, now: dt.datetime) -> None:
     if ready:
         print("Ready to post:")
         for post in ready:
-            print(f"  {post.path.name}  (slot {post.due:%Y-%m-%d %H:%M}, {post.meta.get('format', 'text')})")
+            print(f"  {post.path.name}  (slot {post.due:%Y-%m-%d %H:%M}, {post.meta.get('format', 'text')})"
+                  f"{approval_note(cfg, post)}")
     else:
         print("Nothing is due.")
     if skipped:
@@ -149,6 +176,15 @@ def cmd_due(cfg: Config, now: dt.datetime) -> None:
     line = token_line(cfg)
     if line:
         print(f"\n{line}")
+
+
+def approval_note(cfg: Config, post) -> str:
+    """Only when approval is required: whether a scheduled run would post this one."""
+    if not cfg.approval_required:
+        return ""
+    state, _current = approval.check(post, cfg)
+    return {approval.APPROVED: "  [approved]", approval.MISSING: "  [not approved]",
+            approval.MISMATCH: "  [approval belongs to a different version]"}[state]
 
 
 LABELS = ("bold", "italic", "headers", "links", "bullets")
@@ -199,6 +235,15 @@ def cmd_schedule(cfg: Config, action: str, auto: bool) -> None:
         print(last_check_line(cfg))
 
 
+def cmd_approve(cfg: Config, path: Path, by: str) -> None:
+    if not path.exists():
+        raise api.PublisherError(f"{path} does not exist.")
+    key = approval.approve(cfg, path, by)
+    print(f"Approved {path.name} as {by.strip()}.")
+    print(f"  key {key[:12]}, over the text, format, alt text, title and media as they are now.")
+    print("  Change any of those and the approval no longer counts. Changing the slot does not.")
+
+
 def resolve_file(cfg: Config, raw: str) -> Path:
     path = Path(raw).expanduser()
     if not path.is_absolute():
@@ -222,7 +267,7 @@ def warn_token_once_a_day(cfg: Config, now: dt.datetime, log) -> None:
         pass
     state = "has expired" if days <= 0 else f"expires in {days:.0f} days"
     log(f"The LinkedIn token {state}. Run 'linkedin-publisher auth'.")
-    notify(f"LinkedIn token {state}", "Run: linkedin-publisher auth")
+    alert(cfg, f"LinkedIn token {state}", "Run: linkedin-publisher auth")
 
 
 def report_new_stranded(cfg: Config, skipped: list, log) -> int:
@@ -235,8 +280,77 @@ def report_new_stranded(cfg: Config, skipped: list, log) -> int:
         queue.write_receipt(cfg, "stranded", post)
         log(f"Missed its slot and was not posted late: {post.path.name}. "
             "Give it a new slot or take it out of the queue.")
-        notify("LinkedIn post missed its slot", f"{post.path.stem} was not posted. You decide what happens.")
+        alert(cfg, "LinkedIn post missed its slot", f"{post.path.stem} was not posted. You decide what happens.")
     return 3 if new else 0
+
+
+def report_unresolved_claims(cfg: Config, now: dt.datetime, log) -> int:
+    """A claim with no outcome after claim_unresolved_minutes means a run took the post and never
+    said how it ended. Nobody posts it again. A person looks at LinkedIn, once.
+    Returns 3 when there was something new to report."""
+    states = queue.load_states(cfg)
+    noted = queue.load_notes(cfg, "claim-unresolved")
+    moment = now.astimezone(dt.UTC)
+    limit = dt.timedelta(minutes=cfg.claim_unresolved_minutes)
+    new = 0
+    for key in claims.keys(cfg):
+        if states.get(key) in queue.RESOLVED_STAGES:
+            continue
+        claim = claims.read(cfg, key)
+        if claim is None or moment - claim.claimed_at <= limit:
+            continue
+        ref = claim.claimed_at.isoformat()
+        if (key, ref) in noted:
+            continue
+        name = claim.file or key[:12]
+        minutes = int((moment - claim.claimed_at).total_seconds() // 60)
+        queue.write_receipt(cfg, "claim-unresolved", key=key, file_name=claim.file, ref=ref)
+        log(f"{name} was claimed {minutes} minutes ago and has no outcome. It will not be posted again. "
+            "Check LinkedIn. If the post is not there, post it again with: "
+            f"linkedin-publisher publish --post --file <the post> --retry")
+        alert(cfg, "LinkedIn post: claimed but no outcome",
+              f"{name} was claimed {minutes} minutes ago and has no outcome. Check LinkedIn.")
+        new += 1
+    return 3 if new else 0
+
+
+APPROVAL_NOTICES = {
+    approval.MISSING: ("approval-missing", "LinkedIn post needs approval",
+                       "{stem} is due and nobody approved it. "
+                       "Run: linkedin-publisher approve --file {path} --by NAME"),
+    approval.MISMATCH: ("approval-mismatch", "LinkedIn post: approval belongs to a different version",
+                        "{stem} changed after it was approved. Check it, then run: "
+                        "linkedin-publisher approve --file {path} --by NAME"),
+}
+
+
+def apply_approval(cfg: Config, ready: list, log) -> tuple[list, int]:
+    """Keep the due posts whose approval matches what would go out now. Every other one is
+    reported once per version, with a note in the receipts, and left alone.
+    Returns (posts to send, 3 when there was something new to report)."""
+    noted = {stage: queue.load_notes(cfg, stage) for stage, _title, _text in APPROVAL_NOTICES.values()}
+    send, reported = [], 0
+    for post in ready:
+        try:
+            state, current = approval.check(post, cfg)
+        except OSError as exc:
+            log(f"Could not read the files of {post.path.name}: {exc}. Not posting it.")
+            continue
+        if state == approval.APPROVED:
+            send.append(post)
+            continue
+        stage, title, template = APPROVAL_NOTICES[state]
+        key = queue.content_key(queue.post_text(post.body, cfg.notes_headings))
+        if (key, current) in noted[stage]:
+            continue
+        noted[stage].add((key, current))
+        queue.write_receipt(cfg, stage, post, ref=current)
+        path = shlex.quote(str(post.path))
+        message = template.format(stem=post.path.stem, path=path)
+        log(f"Not posting {post.path.name}. {message}")
+        alert(cfg, title, message)
+        reported += 1
+    return send, 3 if reported else 0
 
 
 def media_line(post) -> str:
@@ -251,14 +365,39 @@ def media_line(post) -> str:
     return f"image: {post.image.name if post.image else 'none'}"
 
 
+def take_claim(cfg: Config, key: str, path: Path, retry: bool, log) -> bool:
+    """The step that two runs cannot both pass. False means this run must not send, and has said why."""
+    name = path.name
+    if claims.take(cfg, key, name):
+        return True
+    if not retry:
+        log(f"{name}: not posted. A claim for this post exists: another run is sending it, or an "
+            "earlier run ended without an outcome. Check LinkedIn. If the post is not there: "
+            f"linkedin-publisher publish --post --file {path} --retry")
+        return False
+    try:
+        claims.supersede(cfg, key, lambda: key not in queue.load_placed_keys(cfg))
+    except claims.ClaimHeld as exc:
+        log(f"{name}: not posted. {exc}")
+        return False
+    if claims.take(cfg, key, name):
+        log(f"{name}: --retry took over the claim of the earlier attempt.")
+        return True
+    log(f"{name}: not posted. Another run claimed it first.")
+    return False
+
+
 def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None, retry: bool = False) -> int:
-    """mode: dry (show) | notify (signal, never post) | post (post for real)."""
+    """mode: dry (show) | notify (signal, never post) | post (post for real).
+
+    Returns 0, 1 for a run that could not do its work, or 3 when it found something new to
+    report (a missed slot, a claim without an outcome, a post that needs approval)."""
     log = make_log(cfg)
     scheduled = mode == "notify" or (mode == "post" and only is None)
+    report_code = 0
     if scheduled:
         write_heartbeat(cfg, now)
         warn_token_once_a_day(cfg, now, log)
-    stranded_code = 0
 
     if only is not None:
         if mode == "notify":
@@ -282,14 +421,24 @@ def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None, ret
         except queue.QueueUnreadable as exc:
             if scheduled:
                 log(f"Could not read the queue: {exc}")
-                notify("LinkedIn queue unreadable", "A scheduled run could not see the queue. See the log.")
+                alert(cfg, "LinkedIn queue unreadable", "A scheduled run could not see the queue. See the log.")
             raise
         if mode in ("notify", "post"):
-            stranded_code = report_new_stranded(cfg, skipped, log)
+            report_code = report_new_stranded(cfg, skipped, log)
+            report_code = report_unresolved_claims(cfg, now, log) or report_code
+        if mode == "post" and cfg.approval_required:
+            # Before anything is sent: a due post goes out only when a person approved this version.
+            due_count = len(ready)
+            ready, unapproved = apply_approval(cfg, ready, log)
+            report_code = report_code or unapproved
+            held_back = due_count - len(ready)
+        else:
+            held_back = 0
         if not ready:
             if mode != "notify":
-                print("Nothing is due.")
-            return stranded_code
+                print(f"Nothing can be posted: {held_back} due post(s) without a valid approval. "
+                      "See 'linkedin-publisher due'." if held_back else "Nothing is due.")
+            return report_code
         post = ready[0]  # one post per run
         if len(ready) > 1:
             log(f"More than one post is due. Taking {post.path.name}, leaving "
@@ -297,14 +446,14 @@ def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None, ret
 
     if mode == "notify":
         log(f"Due: {post.path.name} (slot {post.due:%Y-%m-%d %H:%M}). Waiting for a person to post it.")
-        notify("LinkedIn post is due", f"{post.path.stem} is due. Run: linkedin-publisher publish --post")
-        return stranded_code
+        alert(cfg, "LinkedIn post is due", f"{post.path.stem} is due. Run: linkedin-publisher publish --post")
+        return report_code
 
     text = queue.post_text(post.body, cfg.notes_headings)
     commentary = littletext.prepare(text)
 
     if mode == "dry":
-        print(f"DRY RUN {post.path.name} (slot {post.due:%Y-%m-%d %H:%M})")
+        print(f"DRY RUN {post.path.name} (slot {post.due:%Y-%m-%d %H:%M}){approval_note(cfg, post)}")
         print(f"characters: {len(commentary)} | format: {post.meta.get('format', 'text')} | "
               f"{media_line(post)}")
         print("-" * 60)
@@ -319,23 +468,34 @@ def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None, ret
             log(f"Another run holds the lock ({int(age.total_seconds())}s old). Stopping.")
             return 1
         log("Found a stale lock, removing it.")
-    cfg.lock_file.parent.mkdir(parents=True, exist_ok=True)
-    cfg.lock_file.touch()
+
+    # The lock above and the receipts read earlier are checks, and two runs can pass them
+    # together. The claim is the step only one of them gets. It comes before the first call
+    # to LinkedIn, the token refresh included, and before this run puts its own lock down:
+    # a run that lost the claim must not remove the lock of the run that won it.
+    key = queue.content_key(text)
+    if not take_claim(cfg, key, post.path, retry, log):
+        return 1
+    try:
+        cfg.lock_file.parent.mkdir(parents=True, exist_ok=True)
+        cfg.lock_file.touch()
+    except OSError:
+        claims.release(cfg, key)     # nothing was sent
+        raise
     try:
         try:
             creds = api.load_credentials(cfg)
             tokens = api.ensure_access_token(cfg, creds, api.read_tokens(cfg), log)
-            image = post.image if post.meta.get("format") == "image" else None
-            video = post.video if post.meta.get("format") == "video" else None
-            document = post.document if post.meta.get("format") == "document" else None
-            title = post.meta.get("document_title") if document else post.meta.get("video_title")
+            out = queue.outgoing(post)
             # Written before anything is sent. If the run dies while sending, the
             # next run sees an attempt without an outcome and will not retry.
             queue.write_receipt(cfg, "attempt", post)
-            urn = api.publish(cfg, creds, tokens, commentary, image, post.meta.get("alt_text"),
-                              video=video, title=title, document=document)
+            urn = api.publish(cfg, creds, tokens, commentary, out.image, out.alt_text,
+                              video=out.video, title=out.title, document=out.document)
         except api.PreflightRejected as exc:
+            # Nothing was sent, so the claim goes, but only after the receipt says why.
             queue.write_receipt(cfg, "preflight-rejected", post, error=str(exc))
+            claims.release(cfg, key)
             log(f"Skipped by preflight: {post.path.name}: {exc}")
             return 1
         except api.PublishUncertain as exc:
@@ -343,16 +503,17 @@ def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None, ret
             log(f"UNCLEAR: {post.path.name}: {exc} It will not be tried again automatically. "
                 "Check LinkedIn. If the post is not there, run: linkedin-publisher publish --post "
                 f"--file {post.path} --retry")
-            notify("LinkedIn post: unclear if it went out", f"Check LinkedIn before retrying {post.path.stem}.")
+            alert(cfg, "LinkedIn post: unclear if it went out", f"Check LinkedIn before retrying {post.path.stem}.")
             return 1
         except Exception as exc:
             queue.write_receipt(cfg, "failed", post, error=str(exc))
+            claims.release(cfg, key)
             raise
 
         url = api.post_url_for(urn)
         log(f"Sent {len(commentary)} characters ({urn}).")
         # Written before the file moves, so a failed move can never lead to
-        # posting the same text twice.
+        # posting the same text twice. The claim stays for good as well.
         queue.write_receipt(cfg, "placed", post, post_urn=urn, post_url=url)
         try:
             target = queue.move_to_published(post, cfg, url, now.date())
@@ -360,12 +521,12 @@ def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None, ret
             queue.write_receipt(cfg, "move-failed", post, post_urn=urn, post_url=url, error=str(exc))
             log(f"WARNING: {post.path.name} is live ({url}) but could not be moved: {exc}. "
                 "It will not be offered again. Move it by hand.")
-            notify("LinkedIn post is live, cleanup failed", f"{post.path.stem}: move it by hand.")
+            alert(cfg, "LinkedIn post is live, cleanup failed", f"{post.path.stem}: move it by hand.")
             return 1
         log(f"Posted: {post.path.name} -> {url}")
         log(f"Moved to {target}")
-        notify("LinkedIn post is live", f"{post.path.stem}. The first hour counts, answer comments.")
-        return stranded_code
+        alert(cfg, "LinkedIn post is live", f"{post.path.stem}. The first hour counts, answer comments.")
+        return report_code
     finally:
         cfg.lock_file.unlink(missing_ok=True)
 
@@ -397,6 +558,9 @@ def build_parser() -> argparse.ArgumentParser:
     sch.add_argument("--auto", action="store_true",
                      help="post automatically when due, instead of only notifying")
     sub.add_parser("due", help="show what is due and why other posts are skipped")
+    appr = sub.add_parser("approve", help="record that a person approved this exact version of a post")
+    appr.add_argument("--file", required=True, help="the post to approve")
+    appr.add_argument("--by", required=True, help="who approves it; written into the file")
     sub.add_parser("check", help="dry run over the whole queue, no network")
     pub = sub.add_parser("publish", help="show, signal or post the next due post")
     mode = pub.add_mutually_exclusive_group()
@@ -427,6 +591,8 @@ def main(argv: list[str] | None = None) -> int:
             cmd_schedule(cfg, args.action, args.auto)
         elif command == "due":
             cmd_due(cfg, now)
+        elif command == "approve":
+            cmd_approve(cfg, resolve_file(cfg, args.file), args.by)
         elif command == "check":
             cmd_check(cfg)
         elif command == "publish":

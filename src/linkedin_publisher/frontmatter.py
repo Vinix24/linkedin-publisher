@@ -70,3 +70,54 @@ def parse(lines: list[str]) -> dict[str, str]:
         out[key] = _scalar(rest)
         index += 1
     return out
+
+
+def set_fields(raw: str, values: dict[str, str]) -> str:
+    """Return ``raw`` with each key set to its value, and every other byte untouched.
+
+    ``values`` maps a key to the text after ``key: ``, quoting included. A key that is
+    already there keeps its place (a value that was a block scalar loses its indented
+    lines); a key that is not there is added at the end of the frontmatter. Line
+    endings follow the file. A file without frontmatter raises ValueError.
+    """
+    lines = raw.splitlines(keepends=True)
+    if not lines or lines[0].strip() != "---":
+        raise ValueError("the file has no frontmatter")
+    closing = next((i for i in range(1, len(lines)) if lines[i].strip() == "---"), None)
+    if closing is None:
+        raise ValueError("the frontmatter is never closed")
+    eol = _eol(lines[0])
+
+    out = lines[:1]
+    seen: set[str] = set()
+    index = 1
+    while index < closing:
+        line = lines[index]
+        match = KEY_RE.match(line.rstrip("\r\n"))
+        key = match.group(1) if match else None
+        if key not in values:
+            out.append(line)
+            index += 1
+            continue
+        block = bool(BLOCK_RE.match(COMMENT_RE.sub("", match.group(2)).strip()))
+        index += 1
+        if block:
+            end = index
+            while end < closing and (lines[end][:1] in (" ", "\t") or not lines[end].strip()):
+                end += 1
+            while end > index and not lines[end - 1].strip():   # blank lines after the value are not part of it
+                end -= 1
+            index = end
+        if key not in seen:       # a duplicate of the key is dropped, the first one counts
+            seen.add(key)
+            out.append(f"{key}: {values[key]}{_eol(line, eol)}")
+    out.extend(f"{key}: {value}{eol}" for key, value in values.items() if key not in seen)
+    out.extend(lines[closing:])
+    return "".join(out)
+
+
+def _eol(line: str, default: str = "\n") -> str:
+    for ending in ("\r\n", "\n", "\r"):
+        if line.endswith(ending):
+            return ending
+    return default
