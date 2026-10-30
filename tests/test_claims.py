@@ -489,14 +489,41 @@ def test_a_young_claim_is_not_reported_yet(setup):
     assert setup.notifications() == [] and setup.receipt_stages() == []
 
 
-@pytest.mark.parametrize("stage", ["placed", "failed", "preflight-rejected"])
-def test_a_claim_with_an_outcome_is_not_reported(setup, stage):
+def test_the_claim_of_a_placed_post_is_not_reported(setup):
     path = setup.post()
-    key = key_of(setup)
-    write_claim(setup, key, pid=dead_pid(), age_minutes=120)
-    queue.write_receipt(setup.cfg, stage, queue.read_post(path))
-    setup.run("publish", "--notify")
+    write_claim(setup, key_of(setup), pid=dead_pid(), age_minutes=120)
+    queue.write_receipt(setup.cfg, "placed", queue.read_post(path))
+    assert setup.run("publish", "--notify") == 0
     assert setup.notifications() == []
+    assert setup.receipt_stages() == ["placed"]
+
+
+@pytest.mark.parametrize("stage", ["failed", "preflight-rejected"])
+def test_a_stale_claim_after_an_earlier_release_is_reported_once(setup, stage):
+    """An earlier run ended clearly and released its claim. A later run took a new claim and
+    died before it wrote anything. The old receipt says nothing about this claim."""
+    path = setup.post()
+    post = queue.read_post(path)
+    queue.write_receipt(setup.cfg, "attempt", post)
+    queue.write_receipt(setup.cfg, stage, post)
+    write_claim(setup, key_of(setup), pid=dead_pid(), age_minutes=30)
+    assert setup.run("publish", "--notify") == 3
+    assert setup.run("publish", "--notify") == 0
+    assert setup.titles() == ["LinkedIn post: claimed but no outcome"]
+    assert "a.md" in setup.notifications()[0][1]
+    assert setup.receipt_stages() == ["attempt", stage, "claim-unresolved"]
+
+
+@pytest.mark.parametrize("stage", ["failed", "preflight-rejected"])
+def test_a_fresh_claim_after_an_earlier_release_is_not_reported(setup, stage):
+    path = setup.post()
+    post = queue.read_post(path)
+    queue.write_receipt(setup.cfg, "attempt", post)
+    queue.write_receipt(setup.cfg, stage, post)
+    write_claim(setup, key_of(setup), pid=os.getpid(), age_minutes=5)
+    assert setup.run("publish", "--notify") == 0
+    assert setup.notifications() == []
+    assert setup.receipt_stages() == ["attempt", stage]
 
 
 def test_the_threshold_is_configurable(tmp_path):

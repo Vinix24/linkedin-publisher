@@ -287,6 +287,9 @@ def report_new_stranded(cfg: Config, skipped: list, log) -> int:
 def report_unresolved_claims(cfg: Config, now: dt.datetime, log) -> int:
     """A claim with no outcome after claim_unresolved_minutes means a run took the post and never
     said how it ended. Nobody posts it again. A person looks at LinkedIn, once.
+    Only 'placed' finishes a claim. 'failed' and 'preflight-rejected' remove their claim right after
+    the receipt, so a claim that outlives the limit next to one of them is a later attempt that
+    died, or a run that stopped between the two steps. The old receipt says nothing about it.
     Returns 3 when there was something new to report."""
     states = queue.load_states(cfg)
     noted = queue.load_notes(cfg, "claim-unresolved")
@@ -294,7 +297,7 @@ def report_unresolved_claims(cfg: Config, now: dt.datetime, log) -> int:
     limit = dt.timedelta(minutes=cfg.claim_unresolved_minutes)
     new = 0
     for key in claims.keys(cfg):
-        if states.get(key) in queue.RESOLVED_STAGES:
+        if states.get(key) == "placed":
             continue
         claim = claims.read(cfg, key)
         if claim is None or moment - claim.claimed_at <= limit:

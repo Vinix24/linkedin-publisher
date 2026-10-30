@@ -317,7 +317,7 @@ LinkedIn zero times and writes no `failed` receipt. This applies to every way of
 | `uncertain`, or the run dies | stays |
 
 A claim that stays without an outcome is unresolved. A scheduled run reports a claim that is
-older than 15 minutes and has no `placed` or `failed` receipt, once, and tells you to look at
+older than 15 minutes and whose post has no `placed` receipt, once, and tells you to look at
 LinkedIn. Nobody posts that post again by themselves. A video can take up to 15 minutes to
 process, so if you post video, raise the limit:
 

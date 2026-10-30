@@ -346,8 +346,6 @@ def write_receipt(cfg: Config, stage: str, post: Post | None = None, *,
 
 
 UNCERTAIN_STAGES = {"attempt", "uncertain"}
-# Nothing more can come of these: the post went out, or it is known that nothing was sent.
-RESOLVED_STAGES = {"placed", "failed", "preflight-rejected"}
 # Notes tell a person something once. They are not outcomes and must never stand in for one.
 NOTE_STAGES = frozenset({"stranded", "approval-missing", "approval-mismatch", "claim-unresolved"})
 
