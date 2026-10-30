@@ -458,11 +458,25 @@ def take_claim(cfg: Config, key: str, path: Path, retry: bool, log) -> bool:
     return False
 
 
-def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None, retry: bool = False) -> int:
+REQUIRE_APPROVAL_TITLE = "LinkedIn publish stopped: approval is not required"
+REQUIRE_APPROVAL_MESSAGE = ("--require-approval was given, but [approval] required is not true in the configuration, "
+                            "so nothing was sent. Set required = true under [approval].")
+
+
+def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None, retry: bool = False,
+                require_approval: bool = False) -> int:
     """mode: dry (show) | notify (signal, never post) | post (post for real).
+
+    ``require_approval`` is for a job nobody watches. ``[approval] required`` is off by default, and a
+    run under a configuration without it posts everything that is due. With the flag such a run stops
+    first, in every mode, before it writes or reads anything: no heartbeat, no log, no queue, no
+    receipt. The person hears about it through ``alert``, once per run.
 
     Returns 0, 1 for a run that could not do its work, or 3 when it found something new to
     report (a missed slot, a claim without an outcome, a post that needs approval)."""
+    if require_approval and not cfg.approval_required:
+        alert(cfg, REQUIRE_APPROVAL_TITLE, REQUIRE_APPROVAL_MESSAGE)
+        raise api.PublisherError(REQUIRE_APPROVAL_MESSAGE)
     log = make_log(cfg)
     scheduled = mode == "notify" or (mode == "post" and only is None)
     report_code = 0
@@ -823,6 +837,9 @@ def build_parser() -> argparse.ArgumentParser:
     mode = pub.add_mutually_exclusive_group()
     mode.add_argument("--post", action="store_true", help="post for real")
     mode.add_argument("--notify", action="store_true", help="only signal that a post is due (for cron/launchd)")
+    pub.add_argument("--require-approval", action="store_true",
+                     help="for a job nobody watches: stop with an error and a notification, and send nothing, "
+                          "unless [approval] required = true in the configuration")
     pub.add_argument("--file", help="post this file now, outside its slot")
     pub.add_argument("--retry", action="store_true",
                      help="with --file: try again after an unclear outcome, once you checked LinkedIn")
@@ -861,7 +878,7 @@ def main(argv: list[str] | None = None) -> int:
             only = resolve_file(cfg, args.file) if args.file else None
             if args.retry and only is None:
                 raise api.PublisherError("--retry only works together with --file.")
-            return cmd_publish(cfg, now, mode, only, args.retry)
+            return cmd_publish(cfg, now, mode, only, args.retry, args.require_approval)
         return 0
     except (ConfigError, api.PublisherError, schedule.ScheduleError, queue.QueueUnreadable) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

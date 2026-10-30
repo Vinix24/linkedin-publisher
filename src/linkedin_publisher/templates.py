@@ -34,6 +34,9 @@ version = "202606"   # LinkedIn API version (YYYYMM). Override with LINKEDIN_API
 
 # [approval]
 # required = true    # a scheduled `publish --post` only posts a post that `approve` signed off
+#                    # without it (the default) a scheduled run posts everything due. A job nobody watches
+#                    # can run `publish --post --require-approval`: it sends nothing and notifies you
+#                    # when this is not true
 # external_route_field = "note"            # posts whose field holds this text, and that carry no approval,
 # external_route_text = "runs via a cron"  # run on another route: not checked, not posted by this tool
 

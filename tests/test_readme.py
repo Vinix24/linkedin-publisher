@@ -18,3 +18,11 @@ def test_the_readme_has_toml_examples():
 def test_each_readme_example_loads(tmp_path, example):
     (tmp_path / "publisher.toml").write_text(example, encoding="utf-8")
     load_config(str(tmp_path / "publisher.toml"))
+
+
+def test_the_require_approval_flag_is_documented_where_a_person_looks(capsys):
+    from linkedin_publisher import cli, templates
+    assert "--require-approval" in README and "--require-approval" in templates.CONFIG
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main(["publish", "--help"])
+    assert exit_info.value.code == 0 and "--require-approval" in capsys.readouterr().out

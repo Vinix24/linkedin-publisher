@@ -195,6 +195,8 @@ linkedin-publisher approve --file queue/2026-10-01-my-post.md --by "Your Name"
                                         # sign off on this exact version, see Approval
 linkedin-publisher measure              # update the measured number of tomorrow's posts, never posts
 linkedin-publisher precheck             # what would stop the posts of today and tomorrow, never posts
+linkedin-publisher publish --post --require-approval
+                                        # for a job nobody watches: refuses unless approval is required
 ```
 
 One post per run. If two are due, it takes the first and tells you about the other.
@@ -237,6 +239,22 @@ required, and a notification command for the messages you would otherwise miss:
 ```bash
 linkedin-publisher schedule install --auto
 ```
+
+`[approval] required` is off by default. Under a configuration where it is missing or `false`, a
+scheduled `publish --post` posts everything that is due, approved or not. A job that nobody watches
+can say that it relies on approval:
+
+```bash
+linkedin-publisher publish --post --require-approval
+```
+
+With the flag, a run whose configuration does not have `required = true` under `[approval]` sends
+nothing. It stops before it reads the queue, the receipts or anything else, exits with 1 and an error
+that names the option, and sends one notification, so the job is not stopped in silence. It writes no
+note in the receipts. This holds for every form of `publish`, `--notify`, the dry run and `--file`
+included. With `required = true` the flag changes nothing, and without the flag nothing changes
+either. `schedule install --auto` and the GitHub Actions workflow do not add the flag. It is for a
+command you write yourself, in cron or a systemd unit for instance.
 
 ## Approval: a person signs off on one version
 

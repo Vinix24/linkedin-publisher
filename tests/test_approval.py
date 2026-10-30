@@ -437,3 +437,93 @@ def test_stranded_and_approval_notes_do_not_stop_a_later_valid_post(strict):
     approve(strict, "b.md")
     run_scheduled(strict, SLOT_PLUS_5)
     assert [s["commentary"] for s in strict.sends] == ["On time."]
+
+
+# ------------------------------------------------ --require-approval, for a job nobody watches
+
+REFUSED_TITLE = "LinkedIn publish stopped: approval is not required"
+NOT_REQUIRED = [("", "missing"), ("[approval]\nrequired = false\n", "false")]
+MODES = {"post": ("--post",), "notify": ("--notify",), "dry": (), "file": ("--post", "--file", "FILE")}
+
+
+def argv_for(mode: str, path) -> list[str]:
+    return [str(path) if arg == "FILE" else arg for arg in MODES[mode]]
+
+
+@pytest.mark.parametrize("mode", sorted(MODES))
+@pytest.mark.parametrize("toml", [t for t, _ in NOT_REQUIRED], ids=[i for _, i in NOT_REQUIRED])
+def test_the_flag_stops_a_run_when_the_config_does_not_require_approval(tmp_path, monkeypatch, capsys, toml, mode):
+    setup = Setup(tmp_path, toml)
+    setup.install_fake_linkedin(monkeypatch)
+    path = setup.post()
+    before = path.read_bytes()
+    assert setup.run("publish", "--require-approval", *argv_for(mode, path)) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("ERROR: ") and "[approval]" in err and "required = true" in err
+    assert setup.sends == []
+    assert setup.titles() == [REFUSED_TITLE] and len(setup.notifications()) == 1
+    assert "[approval]" in setup.notifications()[0][1]
+    # Nothing else happened: no heartbeat, no log, no receipt, no claim, no lock, the post is as it was.
+    assert not setup.cfg.heartbeat_file.exists() and not setup.cfg.log_file.exists()
+    assert not setup.cfg.receipts_dir.exists() and not setup.cfg.lock_file.exists()
+    assert path.read_bytes() == before and [p.name for p in setup.cfg.queue_dir.iterdir()] == ["a.md"]
+
+
+@pytest.mark.parametrize("mode", ["post", "notify"])
+def test_the_flag_is_checked_before_the_queue_is_read(tmp_path, capsys, mode):
+    setup = Setup(tmp_path)
+    setup.cfg.queue_dir.rmdir()
+    assert setup.run("publish", "--require-approval", *argv_for(mode, None)) == 1
+    assert "[approval]" in capsys.readouterr().err
+    assert setup.titles() == [REFUSED_TITLE]            # and not also "queue unreadable"
+
+
+def test_the_flag_in_front_of_the_other_flags_or_behind_them_is_the_same(tmp_path, capsys):
+    setup = Setup(tmp_path)
+    setup.post()
+    assert setup.run("publish", "--post", "--require-approval") == 1
+    assert setup.run("publish", "--require-approval", "--notify") == 1
+    assert setup.titles() == [REFUSED_TITLE, REFUSED_TITLE]
+
+
+@pytest.mark.parametrize("mode", ["post", "notify", "dry"])
+def test_with_approval_required_the_flag_changes_nothing(tmp_path, monkeypatch, mode):
+    outcomes = []
+    for name, flag in (("without", False), ("with", True)):
+        base = tmp_path / name
+        base.mkdir()
+        setup = Setup(base, REQUIRED)
+        setup.install_fake_linkedin(monkeypatch)
+        setup.post("a.md", {"slot_time": "09:00"}, body="Not approved.")
+        setup.post("b.md", {"slot_time": "09:30"}, body="Approved.")
+        approve(setup, "b.md")
+        code = cli.cmd_publish(setup.cfg, SLOT_PLUS_5, {"post": "post", "notify": "notify", "dry": "dry"}[mode], None,
+                               require_approval=flag)
+        outcomes.append((code, setup.titles(), setup.receipt_stages(), [s["commentary"] for s in setup.sends],
+                         sorted(p.name for p in setup.cfg.queue_dir.iterdir())))
+    assert outcomes[0] == outcomes[1]
+    code, titles, stages, sent, queued = outcomes[1]
+    assert REFUSED_TITLE not in titles
+    if mode == "post":
+        assert (code, sent, stages, queued) == (3, ["Approved."], ["approval-missing", "attempt", "placed"], ["a.md"])
+        assert titles == ["LinkedIn post needs approval", "LinkedIn post is live"]
+    elif mode == "notify":
+        assert (code, sent, titles) == (0, [], ["LinkedIn post is due"])
+
+
+def test_with_approval_required_an_approved_post_goes_out_through_the_command_line_with_the_flag(strict):
+    path = strict.post()
+    approve(strict)
+    assert strict.run("publish", "--post", "--file", str(path), "--require-approval") == 0
+    assert len(strict.sends) == 1 and strict.titles() == ["LinkedIn post is live"]
+    assert strict.receipt_stages() == ["attempt", "placed"]
+
+
+def test_without_the_flag_a_config_that_does_not_require_approval_posts_as_before(tmp_path, monkeypatch):
+    setup = Setup(tmp_path, "[approval]\nrequired = false\n")
+    setup.install_fake_linkedin(monkeypatch)
+    setup.post()
+    assert cli.cmd_publish(setup.cfg, SLOT_PLUS_5, "post", None) == 0
+    assert len(setup.sends) == 1
+    assert setup.titles() == ["LinkedIn post is live"] and setup.receipt_stages() == ["attempt", "placed"]
+    assert setup.cfg.heartbeat_file.exists()
