@@ -13,6 +13,10 @@ ready_status = "queued"          # only posts with this status can go out
 published_status = "published"   # set on the file after posting
 expires_key = "expires"          # optional date after which a post is stale
 notes_headings = ["Notes"]       # a heading with this name starts private notes
+# Where `approve` records who approved a post, when, and which version:
+# approved_by_field = "approved_by"
+# approved_at_field = "approved_at"
+# approved_key_field = "approved_key"
 
 [slots]
 # Default posting time when a post has a `slot` date but no `slot_time`.
@@ -23,6 +27,15 @@ grace_minutes = 90   # a post that missed its slot by more than this is not post
 
 [api]
 version = "202606"   # LinkedIn API version (YYYYMM). Override with LINKEDIN_API_VERSION.
+
+# [approval]
+# required = true    # a scheduled `publish --post` only posts a post that `approve` signed off
+
+# [notify]
+# command = ["/path/to/script"]   # for a job nobody watches; gets the title and message as last arguments
+
+# [claims]
+# unresolved_minutes = 15   # a claim with no outcome after this long is reported once
 """
 
 ENV = """\
