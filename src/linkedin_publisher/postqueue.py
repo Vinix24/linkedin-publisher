@@ -196,6 +196,17 @@ def queue_files(cfg: Config) -> list[Path]:
                   if n.endswith(".md") and n.lower() != "readme.md")
 
 
+def held_by_earlier_attempt(cfg: Config, post: Post) -> bool:
+    """A post with a measure line whose file a claim names, under any text.
+
+    The number of a measure line is the one part of a post that may change after the approval, so
+    a digits-only edit by hand after an unclear send attempt (``uncertain``, a crash, ``placed`` with
+    a failed move) keeps the approval. The text has a new hash then: no receipt and no claim knows
+    it, while the claim of the attempt still names the file. Every other post is judged by its text
+    alone, as before."""
+    return bool(post.meta.get(cfg.measure_line_field)) and claims.held_for_file(cfg, post.path.name)
+
+
 def collect(cfg: Config, now: dt.datetime) -> tuple[list[Post], list[Post]]:
     """Return (ready to post, skipped with a reason)."""
     ready: list[Post] = []
@@ -226,6 +237,13 @@ def collect(cfg: Config, now: dt.datetime) -> tuple[list[Post], list[Post]]:
             post.reason = ("a claim exists: another run is sending it, or an earlier run ended without "
                            "an outcome. Check LinkedIn. If the post is not there: "
                            f"linkedin-publisher publish --post --file {post.path} --retry")
+            skipped.append(post)
+            continue
+
+        if held_by_earlier_attempt(cfg, post):
+            post.reason = ("an earlier attempt of this post left a claim for another version of its text, for "
+                           "instance the number changed by hand. It may have gone through. Check LinkedIn. "
+                           f"If the post is not there: linkedin-publisher publish --post --file {post.path} --retry")
             skipped.append(post)
             continue
 
@@ -347,7 +365,8 @@ def write_receipt(cfg: Config, stage: str, post: Post | None = None, *,
 
 UNCERTAIN_STAGES = {"attempt", "uncertain"}
 # Notes tell a person something once. They are not outcomes and must never stand in for one.
-NOTE_STAGES = frozenset({"stranded", "approval-missing", "approval-mismatch", "claim-unresolved"})
+NOTE_STAGES = frozenset({"stranded", "approval-missing", "approval-mismatch", "claim-unresolved",
+                         "measured", "measure-failed", "check-failed", "precheck"})
 
 
 def _receipt_rows(cfg: Config):

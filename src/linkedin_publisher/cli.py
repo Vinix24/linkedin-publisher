@@ -2,17 +2,20 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import json
 import platform
 import shlex
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import requests
 
-from . import __version__, api, approval, claims, cloud, littletext, postqueue as queue, schedule, templates
+from . import (__version__, api, approval, checks, claims, cloud, littletext, measures, precheck,
+               postqueue as queue, schedule, templates)
 from .config import DEFAULT_CONFIG_NAME, Config, ConfigError, load_config
 
 TOKEN_WARN_DAYS = 7
@@ -167,6 +170,8 @@ def cmd_due(cfg: Config, now: dt.datetime) -> None:
         for post in ready:
             print(f"  {post.path.name}  (slot {post.due:%Y-%m-%d %H:%M}, {post.meta.get('format', 'text')})"
                   f"{approval_note(cfg, post)}")
+            for check in checks.parse(post.meta.get(cfg.checks_field)):
+                print(f"      check, asked by a scheduled run: {check.line}")
     else:
         print("Nothing is due.")
     if skipped:
@@ -182,7 +187,11 @@ def approval_note(cfg: Config, post) -> str:
     """Only when approval is required: whether a scheduled run would post this one."""
     if not cfg.approval_required:
         return ""
+    if approval.is_external(post, cfg):
+        return "  [external route]"
     state, _current = approval.check(post, cfg)
+    if state == approval.MISMATCH and approval.measure_line_problem(post, cfg):
+        return "  [measure line does not match]"
     return {approval.APPROVED: "  [approved]", approval.MISSING: "  [not approved]",
             approval.MISMATCH: "  [approval belongs to a different version]"}[state]
 
@@ -242,6 +251,8 @@ def cmd_approve(cfg: Config, path: Path, by: str) -> None:
     print(f"Approved {path.name} as {by.strip()}.")
     print(f"  key {key[:12]}, over the text, format, alt text, title and media as they are now.")
     print("  Change any of those and the approval no longer counts. Changing the slot does not.")
+    if measures.line_of(queue.read_post(path), cfg):
+        print("  The measured number in the measure line is not part of the key. Nothing else in the post may change.")
 
 
 def resolve_file(cfg: Config, raw: str) -> Path:
@@ -327,13 +338,22 @@ APPROVAL_NOTICES = {
 }
 
 
+MEASURE_LINE_NOTICE = ("LinkedIn post: measure line does not match",
+                       "{stem} cannot be approved: {problem}")
+
+
 def apply_approval(cfg: Config, ready: list, log) -> tuple[list, int]:
     """Keep the due posts whose approval matches what would go out now. Every other one is
     reported once per version, with a note in the receipts, and left alone.
+    A post on an external route (see ``approval.is_external``) is none of this tool's business: it
+    is not sent, and it gets no note and no notification, only a line in the log.
     Returns (posts to send, 3 when there was something new to report)."""
     noted = {stage: queue.load_notes(cfg, stage) for stage, _title, _text in APPROVAL_NOTICES.values()}
     send, reported = [], 0
     for post in ready:
+        if approval.is_external(post, cfg):
+            log(f"{post.path.name} runs through another route. Leaving it to that route.")
+            continue
         try:
             state, current = approval.check(post, cfg)
         except OSError as exc:
@@ -343,17 +363,50 @@ def apply_approval(cfg: Config, ready: list, log) -> tuple[list, int]:
             send.append(post)
             continue
         stage, title, template = APPROVAL_NOTICES[state]
+        problem = approval.measure_line_problem(post, cfg) if state == approval.MISMATCH else None
+        if problem:
+            title, template = MEASURE_LINE_NOTICE
         key = queue.content_key(queue.post_text(post.body, cfg.notes_headings))
         if (key, current) in noted[stage]:
             continue
         noted[stage].add((key, current))
         queue.write_receipt(cfg, stage, post, ref=current)
         path = shlex.quote(str(post.path))
-        message = template.format(stem=post.path.stem, path=path)
+        message = template.format(stem=post.path.stem, path=path, problem=problem)
         log(f"Not posting {post.path.name}. {message}")
         alert(cfg, title, message)
         reported += 1
     return send, 3 if reported else 0
+
+
+def apply_checks(cfg: Config, ready: list, log) -> tuple[list, int, int]:
+    """Ask the checks of the due posts, in slot order, until one post passes all of its own.
+
+    A post with a failing check is not sent and does not hold up the next one. Each failing check
+    is reported once, with a note in the receipts; the next run asks again, so a site that was
+    down for a moment does not cost the post. The posts after the first one that passes are
+    returned unasked: only one post goes out per run.
+    Returns (posts to send, posts held back, 3 when there was something new to report)."""
+    noted = queue.load_notes(cfg, "check-failed")
+    held, reported = 0, 0
+    for index, post in enumerate(ready):
+        failures = checks.run_all(checks.parse(post.meta.get(cfg.checks_field)), cfg.check_timeout_seconds)
+        if not failures:
+            return ready[index:], held, 3 if reported else 0
+        held += 1
+        key = queue.content_key(queue.post_text(post.body, cfg.notes_headings))
+        until = post.due + dt.timedelta(minutes=cfg.grace_minutes)
+        for failure in failures:
+            message = (f"{post.path.stem} (slot {post.due:%Y-%m-%d %H:%M}) was not sent. Check failed, "
+                       f"{failure.describe()}. The next run asks again, until {until:%H:%M}.")
+            log(f"Not posting {post.path.name}. {message}")
+            if (key, failure.ref) in noted:
+                continue
+            noted.add((key, failure.ref))
+            queue.write_receipt(cfg, "check-failed", post, ref=failure.ref, error=failure.describe())
+            alert(cfg, "LinkedIn post held back: a check failed", message)
+            reported += 1
+    return [], held, 3 if reported else 0
 
 
 def media_line(post) -> str:
@@ -366,6 +419,21 @@ def media_line(post) -> str:
         size = media.stat().st_size / (1024 * 1024)
         return f"{fmt}: {media.name} ({size:.1f} MB{', title: ' + title if title else ''})"
     return f"image: {post.image.name if post.image else 'none'}"
+
+
+def held_back_line(unapproved: int, failing_checks: int, external: int = 0) -> str:
+    reasons = []
+    if unapproved:
+        reasons.append(f"{unapproved} without a valid approval")
+    if failing_checks:
+        reasons.append(f"{failing_checks} with a failing check")
+    if not reasons:
+        if external:
+            return f"Nothing to post here: {external} due post(s) run through another route."
+        return "Nothing is due."
+    if external:
+        reasons.append(f"{external} on another route")
+    return f"Nothing can be posted: due post(s), {', '.join(reasons)}. See 'linkedin-publisher due' and the log."
 
 
 def take_claim(cfg: Config, key: str, path: Path, retry: bool, log) -> bool:
@@ -390,11 +458,25 @@ def take_claim(cfg: Config, key: str, path: Path, retry: bool, log) -> bool:
     return False
 
 
-def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None, retry: bool = False) -> int:
+REQUIRE_APPROVAL_TITLE = "LinkedIn publish stopped: approval is not required"
+REQUIRE_APPROVAL_MESSAGE = ("--require-approval was given, but [approval] required is not true in the configuration, "
+                            "so nothing was sent. Set required = true under [approval].")
+
+
+def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None, retry: bool = False,
+                require_approval: bool = False) -> int:
     """mode: dry (show) | notify (signal, never post) | post (post for real).
+
+    ``require_approval`` is for a job nobody watches. ``[approval] required`` is off by default, and a
+    run under a configuration without it posts everything that is due. With the flag such a run stops
+    first, in every mode, before it writes or reads anything: no heartbeat, no log, no queue, no
+    receipt. The person hears about it through ``alert``, once per run.
 
     Returns 0, 1 for a run that could not do its work, or 3 when it found something new to
     report (a missed slot, a claim without an outcome, a post that needs approval)."""
+    if require_approval and not cfg.approval_required:
+        alert(cfg, REQUIRE_APPROVAL_TITLE, REQUIRE_APPROVAL_MESSAGE)
+        raise api.PublisherError(REQUIRE_APPROVAL_MESSAGE)
     log = make_log(cfg)
     scheduled = mode == "notify" or (mode == "post" and only is None)
     report_code = 0
@@ -417,6 +499,9 @@ def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None, ret
         if key in queue.load_uncertain_keys(cfg) and not retry:
             raise api.PublisherError(f"{only.name}: an earlier attempt may have gone through. Check "
                                      "LinkedIn. If the post is not there, add --retry.")
+        if not retry and queue.held_by_earlier_attempt(cfg, post):
+            raise api.PublisherError(f"{only.name}: an earlier attempt of this post left a claim. It may have "
+                                     "gone through. Check LinkedIn. If the post is not there, add --retry.")
         post.due = now
     else:
         try:
@@ -429,18 +514,21 @@ def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None, ret
         if mode in ("notify", "post"):
             report_code = report_new_stranded(cfg, skipped, log)
             report_code = report_unresolved_claims(cfg, now, log) or report_code
+        unapproved_count = check_held = external_count = 0
         if mode == "post" and cfg.approval_required:
             # Before anything is sent: a due post goes out only when a person approved this version.
             due_count = len(ready)
+            external_count = sum(approval.is_external(post, cfg) for post in ready)
             ready, unapproved = apply_approval(cfg, ready, log)
             report_code = report_code or unapproved
-            held_back = due_count - len(ready)
-        else:
-            held_back = 0
+            unapproved_count = due_count - len(ready) - external_count
+        if mode == "post":
+            # After the approval and before the claim: the addresses the post names must answer.
+            ready, check_held, failed_checks = apply_checks(cfg, ready, log)
+            report_code = report_code or failed_checks
         if not ready:
             if mode != "notify":
-                print(f"Nothing can be posted: {held_back} due post(s) without a valid approval. "
-                      "See 'linkedin-publisher due'." if held_back else "Nothing is due.")
+                print(held_back_line(unapproved_count, check_held, external_count))
             return report_code
         post = ready[0]  # one post per run
         if len(ready) > 1:
@@ -459,6 +547,8 @@ def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None, ret
         print(f"DRY RUN {post.path.name} (slot {post.due:%Y-%m-%d %H:%M}){approval_note(cfg, post)}")
         print(f"characters: {len(commentary)} | format: {post.meta.get('format', 'text')} | "
               f"{media_line(post)}")
+        for check in checks.parse(post.meta.get(cfg.checks_field)):
+            print(f"check, asked by a scheduled run: {check.line}")
         print("-" * 60)
         print(commentary)
         print("-" * 60)
@@ -534,7 +624,177 @@ def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None, ret
         cfg.lock_file.unlink(missing_ok=True)
 
 
+# ---------------------------------------------------------------------- measure
+
+def cmd_measure(cfg: Config, now: dt.datetime, days_ahead: int) -> int:
+    """Update the measured number of every queued post whose slot is today or within ``days_ahead``
+    days. It never posts. A post is left alone once its slot has been reached or anything has
+    been tried with its text (see measures.refusal). A measure that fails leaves the number as
+    it is: the post goes out with the last number it had, and a person is told once.
+    Returns 3 when there was something new to report."""
+    log = make_log(cfg)
+    try:
+        paths = queue.queue_files(cfg)
+    except queue.QueueUnreadable as exc:
+        log(f"Could not read the queue: {exc}")
+        alert(cfg, "LinkedIn queue unreadable", "A scheduled run could not see the queue. See the log.")
+        raise
+    last = now.date() + dt.timedelta(days=days_ahead)
+    noted = queue.load_notes(cfg, "measure-failed")
+    reported = sum(measure_post(cfg, path, now, last, noted, log) for path in paths)
+    return 3 if reported else 0
+
+
+def measure_post(cfg: Config, path: Path, now: dt.datetime, last: dt.date, noted: set, log) -> int:
+    """Returns 1 when this post produced a failure that was reported, otherwise 0."""
+    try:
+        original = path.read_bytes()
+        raw = original.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        log(f"Not measuring {path.name}: cannot read the file: {exc}")
+        return 0
+    post = queue.parse_post(path, raw)
+    name = post.meta.get(cfg.measure_field)
+    slot = queue.slot_datetime(post.meta, cfg)
+    if post.meta.get("status") != cfg.ready_status or not name or slot is None \
+            or not now.date() <= slot.date() <= last:
+        return 0
+    why = measures.refusal(cfg, post, slot, now)
+    if why:
+        log(f"Not measuring {path.name}: {why}. The post keeps its number.")
+        return 0
+
+    text = queue.post_text(post.body, cfg.notes_headings)
+    key = queue.content_key(text)
+    current = None
+    started = time.monotonic()
+    try:
+        line = measures.line_of(post, cfg)
+        if line is None:
+            raise measures.MeasureFailed("no-measure-line",
+                                         f"the post names a measure but has no {cfg.measure_line_field}")
+        found = line.find(text)
+        current = found.group(1)
+        measure = cfg.measures.get(name)
+        if measure is None:
+            raise measures.MeasureFailed("unknown-measure", f"'{name}' is not defined in the configuration, "
+                                                            f"as [measures.{name}]")
+        digits = measures.read_number(measure, cfg.root)
+    except measures.MeasureLineError as exc:
+        return report_measure_failure(cfg, post, key, slot, current, exc.ref, str(exc), noted, log)
+    except measures.MeasureFailed as exc:
+        return report_measure_failure(cfg, post, key, slot, current, exc.ref, exc.detail, noted, log)
+
+    # The command may have taken a while, and the world did not wait: ask again before writing.
+    why = measures.refusal(cfg, post, slot, now + dt.timedelta(seconds=time.monotonic() - started))
+    if why:
+        log(f"Not writing the number of {path.name}: {why}. The post keeps its number.")
+        return 0
+    if digits == current:
+        log(f"{path.name}: the number is still {current}.")
+        return 0
+    updated = measures.replace_number(raw, found, digits)
+    try:
+        approval.replace_file(path, original, updated.encode("utf-8"), what="measurement", command="measure")
+    except api.PublisherError as exc:
+        return report_measure_failure(cfg, post, key, slot, current, "write", str(exc), noted, log)
+    new_key = queue.content_key(queue.post_text(queue.parse_post(path, updated).body, cfg.notes_headings))
+    queue.write_receipt(cfg, "measured", key=new_key, file_name=path.name, ref=f"{current}->{digits}")
+    log(f"Measured {path.name}: {current} -> {digits}.")
+    return 0
+
+
+def report_measure_failure(cfg: Config, post, key: str, slot: dt.datetime, current: str | None,
+                           ref: str, detail: str, noted: set, log) -> int:
+    """The number stays as it is. Once per reason and text, a person is told."""
+    keeps = f"keeps its number ({current})" if current else "keeps the number it has"
+    message = f"{post.path.stem} (slot {slot:%Y-%m-%d %H:%M}) {keeps} and still goes out. {detail}"
+    log(f"Could not measure {post.path.name}: {detail}. The post keeps its number.")
+    if (key, ref) in noted:
+        return 0
+    noted.add((key, ref))
+    queue.write_receipt(cfg, "measure-failed", post, ref=ref, error=detail)
+    alert(cfg, "LinkedIn post: number not updated", message)
+    return 1
+
+
+# --------------------------------------------------------------------- precheck
+
+def cmd_precheck(cfg: Config, now: dt.datetime, days_ahead: int, as_json: bool = False) -> int:
+    """Look at the posts of today and the next ``days_ahead`` days that have not reached their slot,
+    and say what would stop them. It never posts and never changes a file. Every problem goes to
+    ``alert`` once per post, problem and day. Returns 3 when anything is wrong, otherwise 0."""
+    log = make_log(cfg)
+    # In JSON mode stdout is the report and nothing else. What the run itself says goes to stderr.
+    with contextlib.redirect_stdout(sys.stderr) if as_json else contextlib.nullcontext():
+        try:
+            reports = precheck.evaluate(cfg, now, days_ahead)
+        except queue.QueueUnreadable as exc:
+            log(f"Could not read the queue: {exc}")
+            alert(cfg, "LinkedIn queue unreadable", "A scheduled run could not see the queue. See the log.")
+            raise
+        alert_precheck_problems(cfg, now, reports)
+    if as_json:
+        print(json.dumps(precheck_json(reports, days_ahead), indent=2))
+    else:
+        print_precheck(reports, now, days_ahead)
+    return 3 if any(report.problems for report in reports) else 0
+
+
+def alert_precheck_problems(cfg: Config, now: dt.datetime, reports: list) -> None:
+    """A problem that is still there on a later day is reported again: the run of the morning
+    must remind a person of what the run of the evening found, while there is time to act."""
+    noted = queue.load_notes(cfg, "precheck")
+    day = now.date().isoformat()
+    for report in reports:
+        key = queue.content_key(queue.post_text(report.post.body, cfg.notes_headings))
+        for problem in report.problems:
+            ref = f"{problem.ref}@{day}"
+            if (key, ref) in noted:
+                continue
+            noted.add((key, ref))
+            queue.write_receipt(cfg, "precheck", report.post, ref=ref, error=problem.message)
+            alert(cfg, "LinkedIn precheck: a post will not go out as planned",
+                  f"{report.post.path.stem} (slot {report.slot:%Y-%m-%d %H:%M}): {problem.message}")
+
+
+def precheck_json(reports: list, days_ahead: int) -> dict:
+    return {"schema": 1, "days_ahead": days_ahead, "posts": [
+        {"post": report.post.path.name, "slot_date": f"{report.slot:%Y-%m-%d}", "slot_time": f"{report.slot:%H:%M}",
+         "route": report.route, "checked": report.checked,
+         "problems": [{"kind": problem.kind, "message": problem.message} for problem in report.problems]}
+        for report in reports]}
+
+
+def print_precheck(reports: list, now: dt.datetime, days_ahead: int) -> None:
+    last = now.date() + dt.timedelta(days=days_ahead)
+    print(f"Precheck {now:%Y-%m-%d %H:%M}: posts with a slot up to and including {last:%Y-%m-%d}\n")
+    if not reports:
+        print("No posts with a slot in this range.")
+        return
+    for report in reports:
+        head = f"{report.slot:%Y-%m-%d %H:%M}  {report.post.path.name}"
+        if not report.checked:
+            print(f"{head}  route: external, not checked")
+        elif not report.problems:
+            print(f"{head}  ok")
+        else:
+            print(f"{head}  {len(report.problems)} problem(s)")
+            for problem in report.problems:
+                print(f"    {problem.kind}: {problem.message}")
+
+
 # --------------------------------------------------------------------------- main
+
+def days_ahead_arg(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"'{value}' is not a whole number of days") from None
+    if number < 0:
+        raise argparse.ArgumentTypeError("must be 0 or more (0 is today only)")
+    return number
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -565,10 +825,21 @@ def build_parser() -> argparse.ArgumentParser:
     appr.add_argument("--file", required=True, help="the post to approve")
     appr.add_argument("--by", required=True, help="who approves it; written into the file")
     sub.add_parser("check", help="dry run over the whole queue, no network")
+    meas = sub.add_parser("measure", help="update the measured number in queued posts, never posts")
+    meas.add_argument("--days-ahead", type=days_ahead_arg, default=1, metavar="N",
+                      help="posts with a slot today up to N days from now (default 1)")
+    pre = sub.add_parser("precheck", help="report what would stop the posts of the coming days, "
+                                          "never posts and never edits")
+    pre.add_argument("--days-ahead", type=days_ahead_arg, default=1, metavar="N",
+                     help="posts with a slot today up to N days from now; 0 is today only (default 1)")
+    pre.add_argument("--json", action="store_true", help="print the report as JSON")
     pub = sub.add_parser("publish", help="show, signal or post the next due post")
     mode = pub.add_mutually_exclusive_group()
     mode.add_argument("--post", action="store_true", help="post for real")
     mode.add_argument("--notify", action="store_true", help="only signal that a post is due (for cron/launchd)")
+    pub.add_argument("--require-approval", action="store_true",
+                     help="for a job nobody watches: stop with an error and a notification, and send nothing, "
+                          "unless [approval] required = true in the configuration")
     pub.add_argument("--file", help="post this file now, outside its slot")
     pub.add_argument("--retry", action="store_true",
                      help="with --file: try again after an unclear outcome, once you checked LinkedIn")
@@ -598,12 +869,16 @@ def main(argv: list[str] | None = None) -> int:
             cmd_approve(cfg, resolve_file(cfg, args.file), args.by)
         elif command == "check":
             cmd_check(cfg)
+        elif command == "measure":
+            return cmd_measure(cfg, now, args.days_ahead)
+        elif command == "precheck":
+            return cmd_precheck(cfg, now, args.days_ahead, args.json)
         elif command == "publish":
             mode = "post" if args.post else "notify" if args.notify else "dry"
             only = resolve_file(cfg, args.file) if args.file else None
             if args.retry and only is None:
                 raise api.PublisherError("--retry only works together with --file.")
-            return cmd_publish(cfg, now, mode, only, args.retry)
+            return cmd_publish(cfg, now, mode, only, args.retry, args.require_approval)
         return 0
     except (ConfigError, api.PublisherError, schedule.ScheduleError, queue.QueueUnreadable) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

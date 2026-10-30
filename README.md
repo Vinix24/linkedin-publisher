@@ -31,11 +31,11 @@ reminder every 15 minutes. The posting itself stays a deliberate step.
 **Posting twice is worse than not posting.** Every attempt leaves a local receipt: one just
 before the post is sent, one with the outcome, both before the file is moved. A post that
 went live is never offered again, not even after a failed move or a renamed file. And when
-LinkedIn's answer is unclear (a timeout, a server error, or a success without a post id),
-the tool does not try again by itself. It tells you to check LinkedIn first. Receipts are
-read first and written later, so two runs that start in the same second could both pass
-them. Before anything is sent, a run therefore takes a *claim* on the post, a file that only
-one run can create. See *One post, one claim*.
+LinkedIn's answer is unclear (a timeout, a server error, a success without a usable post id,
+or any answer that is neither a success nor a refusal), the tool does not try again by itself.
+It tells you to check LinkedIn first. Receipts are read first and written later, so two runs
+that start in the same second could both pass them. Before anything is sent, a run therefore
+takes a *claim* on the post, a file that only one run can create. See *One post, one claim*.
 
 ## What it does and does not do
 
@@ -157,6 +157,9 @@ Anything below a line with only three dashes is private. It is never posted.
 | `alt_text` | for images | Describes the image for people who cannot see it. |
 | `video_title` | no | Title of the video. |
 | `document_title` | for documents | Title LinkedIn shows above the document. |
+| `measure` | no | Name of a measure in `publisher.toml` whose number goes into the post, see *A number that is measured*. |
+| `measure_line` | with `measure` | The sentence the number sits in, with `{n}` where the digits go. |
+| `checks` | no | Addresses that must answer before the post is sent, one per line, see *Checks before sending*. |
 
 **Images:** put the image next to the post with the same name. `2026-10-01-my-post.md` goes
 with `2026-10-01-my-post.png` (or `.jpg`, `.jpeg`, `.gif`).
@@ -190,6 +193,10 @@ linkedin-publisher publish --post --file queue/2026-10-01-my-post.md --retry
                                         # only after an unclear outcome, once you checked LinkedIn
 linkedin-publisher approve --file queue/2026-10-01-my-post.md --by "Your Name"
                                         # sign off on this exact version, see Approval
+linkedin-publisher measure              # update the measured number of tomorrow's posts, never posts
+linkedin-publisher precheck             # what would stop the posts of today and tomorrow, never posts
+linkedin-publisher publish --post --require-approval
+                                        # for a job nobody watches: refuses unless approval is required
 ```
 
 One post per run. If two are due, it takes the first and tells you about the other.
@@ -232,6 +239,22 @@ required, and a notification command for the messages you would otherwise miss:
 ```bash
 linkedin-publisher schedule install --auto
 ```
+
+`[approval] required` is off by default. Under a configuration where it is missing or `false`, a
+scheduled `publish --post` posts everything that is due, approved or not. A job that nobody watches
+can say that it relies on approval:
+
+```bash
+linkedin-publisher publish --post --require-approval
+```
+
+With the flag, a run whose configuration does not have `required = true` under `[approval]` sends
+nothing. It stops before it reads the queue, the receipts or anything else, exits with 1 and an error
+that names the option, and sends one notification, so the job is not stopped in silence. It writes no
+note in the receipts. This holds for every form of `publish`, `--notify`, the dry run and `--file`
+included. With `required = true` the flag changes nothing, and without the flag nothing changes
+either. `schedule install --auto` and the GitHub Actions workflow do not add the flag. It is for a
+command you write yourself, in cron or a systemd unit for instance.
 
 ## Approval: a person signs off on one version
 
@@ -281,6 +304,9 @@ per version of the post and not on every run. `due` shows `[approved]`, `[not ap
 
 `publish --post --file` is a person pressing the button and needs no approval. `--notify`
 only signals that a post is due and is not affected.
+
+A post that carries a number that is measured shortly before it goes out can be approved too: see
+*A number that is measured*.
 
 The check happens when the run has decided to send. A file that someone replaces in the
 seconds between that check and the upload is not caught.
@@ -338,6 +364,194 @@ remove the file yourself after you checked LinkedIn.
 Another program that places posts in the same folder takes part by following the same file
 contract: same path, same `O_EXCL` creation, same JSON, and the same rule that a `placed`
 claim stays.
+
+## A number that is measured
+
+Some posts carry one number that is only known shortly before they go out, such as "There are 53
+items left." An approval is about one exact version, and a number that changes would void it every
+time. Here both fit together: the post names the number and the sentence it sits in, the
+configuration says how to measure it, and the approval key ignores exactly those digits.
+
+In the post:
+
+```yaml
+measure: open-items
+measure_line: "There are {n} items left."
+```
+
+In `publisher.toml`:
+
+```toml
+[measures.open-items]
+command = ["/path/to/count-open-items"]   # an argument list, no shell; runs in the folder of publisher.toml
+pattern = '^OPEN: ([0-9]+)$'               # one group: the number; matched against what the command prints
+timeout_seconds = 60                       # default 60
+```
+
+`{n}` stands for the digits. The rest of `measure_line` is literal, and it has to match the text of
+the post exactly once. A post can name a measure but never a command: the commands are the ones in
+the configuration, and nothing else is ever run.
+
+**The approval.** The key hashes the text with the digits at that place replaced by a fixed token,
+and it covers `measure_line` and the place of the number as well. So only the digits may change
+after `approve`. One other word, a changed `measure_line` or a second number somewhere else voids
+the approval as before. A `measure_line` that matches zero times or more than once cannot be
+approved, and a scheduled run reports such a post as a mismatch. A post without `measure_line` has
+the key it always had.
+
+**Measuring.** Run `measure` from your own scheduler, once a day:
+
+```bash
+linkedin-publisher measure                  # queued posts with a slot today or tomorrow
+linkedin-publisher measure --days-ahead 3   # today up to three days from now
+```
+
+It runs the command with its timeout, and writes only the digits into the file, the same way
+`approve` writes: a temporary file, a check that the file did not change meanwhile, a rename.
+Nothing else in the file changes, not even a line ending. It writes a `measured` note with the old
+and the new number (`53->49`). It never posts, and `publish --post` never measures by itself.
+
+The identity of a post in the receipts and the claims is a hash of its text, digits included. A
+number changed after something was tried with that text would be a post that no receipt and no
+claim knows, and it could go out a second time. So `measure` leaves a post alone, per post, when:
+
+| | |
+|---|---|
+| its slot time has been reached | also checked again after the command ran, which can take a while |
+| a claim exists for its text | |
+| a receipt shows it as placed | |
+| a receipt shows it as uncertain, or an attempt without an outcome | |
+
+`measure` refuses to write the number in these cases. It cannot stop a person from editing the digits
+by hand, and a digits-only edit keeps the approval. So the other commands hold such a post: when any
+claim names the file of a post that has a `measure_line`, a scheduled run skips it and
+`publish --file` stops, both with a message that points at LinkedIn and at `--retry`. That covers an
+earlier attempt that left a claim behind: an unclear outcome, a crash, or a post that went live and
+could not be moved. Look at your profile first. If the post is not there,
+`publish --post --file <the post> --retry` sends it. Posts without a `measure_line` are judged by
+their text alone, as before.
+
+If the measurement fails (the command exits non-zero, runs too long, prints nothing the pattern
+finds, or prints two things it finds) the post keeps its last number and still goes out. You get
+one notification per post and reason (`measure-failed`). The pattern has to find exactly one number
+in the output: a pattern that fits two lines would otherwise quietly pick the wrong one. A number
+of more than 12 digits is treated as a failure too.
+
+## Checks before sending
+
+A post can name addresses that must answer before it goes out. Use it for things that were true
+when you wrote the post: the article you link to is live, or a page still says what the last
+sentence of the post claims.
+
+```yaml
+checks: |
+  https://example.org/blog/my-article
+  https://example.org/waitlist | Join the waiting list
+```
+
+One check per line. An address on its own must answer `200` once redirects are followed. With
+` | text` the page must also contain that text, exactly as written, in the raw page. Use `|`, not
+`>`: a folded block joins the lines into one that cannot be read. Only `http` and `https` are
+accepted. A line that cannot be read counts as a check that failed, because a check nobody can run
+must not let the post through.
+
+A scheduled `publish --post` asks the checks of the posts that are due, after the approval and
+before the claim. If one fails, for whatever reason, a network error included, that post is not
+sent. You get one notification per check and kind of failure, with the post, the slot and the check
+(`check-failed`). The next run asks again, so a site that was down for a minute does not cost the
+post, as long as it answers within the 90 minutes. A post with a failing check does not hold up the
+next due post. All checks of a post are asked, so one run names everything that is wrong.
+
+`publish --post --file` is a person deciding and runs no checks. `due` and the dry run list the
+checks without asking them. Checks are not part of the approval key. How long a check waits:
+
+```toml
+[checks]
+timeout_seconds = 15   # default 15
+```
+
+## Precheck: look at the coming days
+
+`precheck` answers one question ahead of time: what would stop these posts? It never sends, never
+edits a file and never takes a claim.
+
+```bash
+linkedin-publisher precheck                    # posts with a slot today or tomorrow
+linkedin-publisher precheck --days-ahead 0     # today only
+linkedin-publisher precheck --json             # for another tool to read
+```
+
+For every queued post that has not reached its slot yet it looks at:
+
+| | |
+|---|---|
+| approval | valid, when `[approval] required` is on; a `measure_line` that does not match is named |
+| checks | every address answers (this is the one place `precheck` uses the network) |
+| media | the image, video or PDF the format needs is there, and the text passes the preflight |
+| expiry | the `expires` date is not before the day of the slot |
+| blocked | no claim and no unclear attempt that would keep a scheduled run from sending it |
+
+```
+Precheck 2026-09-22 17:00: posts with a slot up to and including 2026-09-23
+
+2026-09-23 10:00  launch.md  1 problem(s)
+    approval-missing: nobody approved it. Run: linkedin-publisher approve --file /home/you/linkedin/queue/launch.md --by NAME
+2026-09-23 11:00  tips.md  ok
+```
+
+The exit code is 0 when nothing is wrong and 3 when something is. Each problem is also sent through
+the notification hook, with the post, the slot and exactly what is missing. A problem is notified
+once per post, problem and calendar day, so a run in the evening and a run the next morning both
+speak up while there is still time to act, and a run every hour does not repeat itself. Every run
+lists all problems, notified or not. The notes are `precheck` in the receipts.
+
+The JSON has a fixed shape:
+
+```json
+{
+  "schema": 1,
+  "days_ahead": 1,
+  "posts": [
+    {"post": "launch.md", "slot_date": "2026-09-23", "slot_time": "10:00",
+     "route": "publisher", "checked": true,
+     "problems": [{"kind": "approval-missing", "message": "nobody approved it. Run: ..."}]}
+  ]
+}
+```
+
+`kind` is one of `approval-missing`, `approval-mismatch`, `measure-line`, `media`, `content`,
+`expired`, `blocked`, `check-failed`.
+
+**Posts that run somewhere else.** While you move posts over from another way of posting, some
+posts do not run through this tool's schedule and have no approval in the file. Name the field and
+the text that marks them:
+
+```toml
+[approval]
+required = true
+external_route_field = "note"             # a frontmatter field, any free text
+external_route_text = "runs via a cron"   # a post whose field contains this text is on another route
+```
+
+Such a post is shown as `route: external, not checked` (`"route": "external", "checked": false` in
+the JSON), with no problem and no notification. It stays visible on purpose: it still hangs on
+something else. The text is matched exactly, capitals included.
+
+A post counts as external only while the file has no `approved_key`. An approval in the file means
+this tool is the route: `precheck` checks the post in full, an approval for a different version is
+reported as `approval-mismatch`, and a scheduled run sends it when the approval is valid.
+
+With approval required, a scheduled `publish --post` leaves an external post alone as well. It does
+not send it, writes no note in the receipts and sends no notification. It writes one line to the log
+(`runs through another route`), and `due` and the dry run show `[external route]` next to it.
+
+Run `measure` and `precheck` from the scheduler you already use. They are plain commands:
+
+```
+7 17 * * *   linkedin-publisher --config /path/to/publisher.toml measure
+30 17 * * *  linkedin-publisher --config /path/to/publisher.toml precheck
+30 8 * * *   linkedin-publisher --config /path/to/publisher.toml precheck --days-ahead 0
+```
 
 ## Notifications for a job nobody watches
 
@@ -458,6 +672,9 @@ published = "published"
 approved_by_field = "approved_by"      # these three are the defaults
 approved_at_field = "approved_at"
 approved_key_field = "approved_key"
+measure_field = "measure"              # and these three
+measure_line_field = "measure_line"
+checks_field = "checks"
 
 [slots]
 default = "10:00"
@@ -465,9 +682,19 @@ grace_minutes = 90
 
 [approval]
 required = true                        # default false: nothing changes for existing setups
+external_route_field = "note"          # default none; posts marked this way and without approved_key are left to their own route
+external_route_text = "runs via a cron"
 
 [claims]
 unresolved_minutes = 15                # default 15
+
+[checks]
+timeout_seconds = 15                   # default 15
+
+[measures.open-items]                  # one section per measure a post can name
+command = ["/path/to/count-open-items"]
+pattern = '^OPEN: ([0-9]+)$'
+timeout_seconds = 60                   # default 60
 
 [notify]
 command = ["/Users/YOU/bin/tell-me"]   # default: none, the desktop notification only
@@ -490,13 +717,18 @@ command = ["/Users/YOU/bin/tell-me"]   # default: none, the desktop notification
 | "claimed but no outcome" | A run took the post and never said how it ended. Same as above: look at LinkedIn first. |
 | "needs approval" | Read the post, then run `linkedin-publisher approve --file <post> --by "Your Name"`. |
 | "approval belongs to a different version" | The text, alt text, title or media changed after the approval. Read it again and approve again. |
+| "check failed" | An address a post names did not answer 200, or lacks its required text. The post is not sent. The next run asks again within the 90 minutes. Fix the site or the `checks` lines. |
+| "number not updated" | `measure` could not get a number. The post goes out with the number it has. The message says why: exit code, timeout, no match, or a pattern that matches twice. |
+| "measure line does not match" | `measure_line` has to match the post text exactly once. Correct the sentence or the template, then approve again. |
+| `precheck` exits 3 | Something would stop a post. The output and the notification say which post and what is missing. |
 | "The notification hook failed" | Your `[notify] command` failed or hung. The log has the exit code or the error. The run itself went on. |
 | GitHub Actions: "The job was not started because recent account payments have failed or your spending limit needs to be increased" | Actions in private repositories are blocked on your GitHub account. Nothing is posted until you fix it under *Settings, Billing and plans*. The run is red, so you will see it. |
 
 The files in `.receipts/` are a plain log of every attempt, one JSON line each. Besides the outcomes
 (`attempt`, `placed`, `uncertain`, `failed`, `preflight-rejected`, `move-failed`) they hold notes that
-tell a person something once: `stranded`, `approval-missing`, `approval-mismatch` and
-`claim-unresolved`. A note never counts as an outcome. `.receipts/claims/` holds the claims.
+tell a person something once: `stranded`, `approval-missing`, `approval-mismatch`,
+`claim-unresolved`, `measure-failed`, `check-failed` and `precheck`. `measured` is a note too: it
+records a changed number. A note never counts as an outcome. `.receipts/claims/` holds the claims.
 
 ## Development
 
@@ -508,7 +740,8 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
 
 The tests cover the parts that can go wrong without anyone noticing: frontmatter parsing,
 escaping, slots, receipts, claims (including separate processes that start at the same moment),
-approvals, moving files, the schedule files and the generated workflows. The calls to LinkedIn
+approvals, the measured number, the checks against a local web server, the precheck, moving files,
+the schedule files and the generated workflows. The calls to LinkedIn
 itself are not unit tested. `status --online` is the safe way to check them.
 
 ## License

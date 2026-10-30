@@ -1,4 +1,5 @@
 """Every way a post could go out twice, tested against real HTTP and real receipts."""
+import contextlib
 import datetime as dt
 import http.server
 import json
@@ -8,7 +9,7 @@ import threading
 import pytest
 from conftest import WEDNESDAY_10, write_post
 
-from linkedin_publisher import api, cli
+from linkedin_publisher import api, claims, cli
 from linkedin_publisher import postqueue as queue
 
 CREDS = {"LINKEDIN_CLIENT_ID": "x", "LINKEDIN_CLIENT_SECRET": "y"}
@@ -30,8 +31,18 @@ def serve(status: int, headers: dict | None = None, body: bytes = b""):
             pass
 
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True).start()
     return server, f"http://127.0.0.1:{server.server_port}/rest/posts"
+
+
+@contextlib.contextmanager
+def served(status: int, headers: dict | None = None, body: bytes = b""):
+    server, url = serve(status, headers, body)
+    try:
+        yield url
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 # ------------------------------------------------ what LinkedIn answers
@@ -62,6 +73,65 @@ def test_refusal_is_a_plain_failure_that_may_be_retried(cfg):
         api.publish(cfg, CREDS, TOKENS, "Hello", posts_url=url)
     assert not isinstance(err.value, api.PublishUncertain)
     server.shutdown()
+
+
+NOT_AN_OBJECT = {"list": b"[]", "list-with-urn": b'["urn:li:share:9"]', "string": b'"urn:li:share:9"',
+                 "number": b"12", "null": b"null", "bool": b"true"}
+UNUSABLE_ID = {"empty-object": b"{}", "id-null": b'{"id": null}', "id-empty": b'{"id": ""}', "id-number": b'{"id": 5}',
+               "id-list": b'{"id": ["urn:li:share:9"]}', "id-object": b'{"id": {"urn": "urn:li:share:9"}}'}
+
+
+@pytest.mark.parametrize("body", [*NOT_AN_OBJECT.values(), *UNUSABLE_ID.values()],
+                         ids=[*NOT_AN_OBJECT, *UNUSABLE_ID])
+def test_a_success_without_a_usable_id_is_uncertain_whatever_the_body_is(cfg, body):
+    with served(201, body=body) as url, pytest.raises(api.PublishUncertain):
+        api.publish(cfg, CREDS, TOKENS, "Hello", posts_url=url)
+
+
+@pytest.mark.parametrize("status", [200, 201])
+def test_an_id_in_the_body_is_used_when_the_header_is_missing(cfg, status):
+    with served(status, body=b'{"id": "urn:li:share:7"}') as url:
+        assert api.publish(cfg, CREDS, TOKENS, "Hello", posts_url=url) == "urn:li:share:7"
+
+
+@pytest.mark.parametrize("status", [202, 204, 302])
+def test_a_success_or_redirect_other_than_200_and_201_is_uncertain_not_a_refusal(cfg, status):
+    with served(status) as url, pytest.raises(api.PublishUncertain):
+        api.publish(cfg, CREDS, TOKENS, "Hello", posts_url=url)
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 422, 429])
+def test_a_client_error_is_a_clear_refusal(cfg, status):
+    with served(status, body=b"no") as url, pytest.raises(api.PublisherError) as err:
+        api.publish(cfg, CREDS, TOKENS, "Hello", posts_url=url)
+    assert not isinstance(err.value, api.PublishUncertain) and str(status) in str(err.value)
+
+
+@pytest.mark.parametrize("status, body", [(201, b"[]"), (201, b'"urn:li:share:9"'), (202, b""), (200, b"12")],
+                         ids=["list", "string", "accepted", "number"])
+def test_an_answer_without_a_usable_id_keeps_the_claim_and_a_second_run_sends_nothing(cfg, monkeypatch, status, body):
+    """The post may be live. A `failed` receipt and a released claim would let the next run post it again."""
+    path = write_post(cfg, "a.md", {"status": "queued", "slot": "2026-09-23"})
+    key = queue.content_key(queue.post_text(queue.read_post(path).body, cfg.notes_headings))
+    calls = []
+    real_publish = api.publish
+    monkeypatch.setattr(api, "load_credentials", lambda _cfg: CREDS)
+    monkeypatch.setattr(api, "read_tokens", lambda _cfg: TOKENS)
+    monkeypatch.setattr(api, "ensure_access_token", lambda *_a: TOKENS)
+    with served(status, body=body) as url:
+        def publish_to_the_local_server(*args, **kwargs):
+            calls.append(1)
+            return real_publish(*args, posts_url=url, **kwargs)
+
+        monkeypatch.setattr(api, "publish", publish_to_the_local_server)
+        assert cli.cmd_publish(cfg, WEDNESDAY_10, "post", None) == 1
+        assert [row["stage"] for row in queue._receipt_rows(cfg)] == ["attempt", "uncertain"]
+        assert claims.exists(cfg, key) and path.exists()
+
+        assert cli.cmd_publish(cfg, WEDNESDAY_10, "post", None) == 0
+        assert len(calls) == 1
+        assert [row["stage"] for row in queue._receipt_rows(cfg)] == ["attempt", "uncertain"]
+        assert queue.load_states(cfg) == {key: "uncertain"}
 
 
 def test_no_connection_is_uncertain(cfg):

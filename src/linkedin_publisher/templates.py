@@ -17,6 +17,10 @@ notes_headings = ["Notes"]       # a heading with this name starts private notes
 # approved_by_field = "approved_by"
 # approved_at_field = "approved_at"
 # approved_key_field = "approved_key"
+# Where a post names the number it measures, the sentence it sits in, and its checks:
+# measure_field = "measure"
+# measure_line_field = "measure_line"
+# checks_field = "checks"
 
 [slots]
 # Default posting time when a post has a `slot` date but no `slot_time`.
@@ -30,12 +34,25 @@ version = "202606"   # LinkedIn API version (YYYYMM). Override with LINKEDIN_API
 
 # [approval]
 # required = true    # a scheduled `publish --post` only posts a post that `approve` signed off
+#                    # without it (the default) a scheduled run posts everything due. A job nobody watches
+#                    # can run `publish --post --require-approval`: it sends nothing and notifies you
+#                    # when this is not true
+# external_route_field = "note"            # posts whose field holds this text, and that carry no approval,
+# external_route_text = "runs via a cron"  # run on another route: not checked, not posted by this tool
 
 # [notify]
 # command = ["/path/to/script"]   # for a job nobody watches; gets the title and message as last arguments
 
 # [claims]
 # unresolved_minutes = 15   # a claim with no outcome after this long is reported once
+
+# [checks]
+# timeout_seconds = 15      # how long an address named in a post's `checks` may take
+
+# [measures.open-items]     # a number a post can name with `measure: open-items`
+# command = ["/path/to/count-open-items"]
+# pattern = '^OPEN: ([0-9]+)$'   # one group: the number in what the command prints
+# timeout_seconds = 60
 """
 
 ENV = """\

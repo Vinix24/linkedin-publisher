@@ -333,6 +333,68 @@ def test_placed_but_the_move_fails_and_the_receipt_and_claim_block_a_second_plac
     assert len(setup.sends) == 1
 
 
+# ------------------------------------------------------------ which file a claim names
+
+def test_held_for_file_is_true_only_for_the_file_a_claim_names(setup):
+    from linkedin_publisher import claims
+    assert claims.held_for_file(setup.cfg, "a.md") is False              # no claims folder at all
+    assert claims.take(setup.cfg, "a" * 64, "a.md")
+    assert claims.held_for_file(setup.cfg, "a.md") is True
+    assert claims.held_for_file(setup.cfg, "b.md") is False
+    assert claims.take(setup.cfg, "b" * 64, "b.md")
+    assert claims.held_for_file(setup.cfg, "b.md") is True and claims.held_for_file(setup.cfg, "a.md") is True
+
+
+@pytest.mark.parametrize("content", ["", "not json", "[1, 2]", "null", '{"pid": 1}', '{"file": null}',
+                                     '{"file": 7}', '{"file": ["a.md"]}', "\x00\x01 a.md"])
+def test_a_claim_that_cannot_be_read_names_no_file(setup, content):
+    from linkedin_publisher import claims
+    path = claim_file(setup, "c" * 64)
+    path.parent.mkdir(parents=True)
+    path.write_text(content, encoding="utf-8")
+    assert claims.held_for_file(setup.cfg, "a.md") is False
+    assert claims.take(setup.cfg, "d" * 64, "a.md")                      # a readable one next to it still counts
+    assert claims.held_for_file(setup.cfg, "a.md") is True
+
+
+def test_a_claim_with_bytes_that_are_not_text_names_no_file(setup):
+    from linkedin_publisher import claims
+    path = claim_file(setup, "c" * 64)
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"\xff\xfe\x00 a.md")
+    assert claims.held_for_file(setup.cfg, "a.md") is False
+
+
+def test_a_retired_claim_names_no_file(setup):
+    from linkedin_publisher import claims
+    key = "e" * 64
+    assert claims.take(setup.cfg, key, "a.md")
+    claims.supersede(setup.cfg, key, lambda: True)
+    assert list(claim_file(setup, key).parent.glob("*.claim.retired-*"))
+    assert not claim_file(setup, key).exists()
+    assert claims.held_for_file(setup.cfg, "a.md") is False
+
+
+def test_a_claim_that_disappears_while_the_folder_is_read_names_no_file(setup, monkeypatch):
+    from linkedin_publisher import claims
+    monkeypatch.setattr(claims, "keys", lambda _cfg: ["f" * 64])
+    assert claims.held_for_file(setup.cfg, "a.md") is False
+
+
+@pytest.mark.parametrize("how", ["scheduled", "file"])
+def test_a_claim_naming_the_file_under_another_key_does_not_hold_a_post_without_a_measure_line(setup, monkeypatch, how):
+    setup.install_fake_linkedin(monkeypatch)
+    path = setup.post()
+    write_claim(setup, "f" * 64, pid=os.getpid(), file="a.md")
+    ready, skipped = queue.collect(setup.cfg, SLOT_PLUS_5)
+    assert [p.path.name for p in ready] == ["a.md"] and skipped == []
+    if how == "scheduled":
+        assert cli.cmd_publish(setup.cfg, SLOT_PLUS_5, "post", None) == 0
+    else:
+        assert setup.run("publish", "--post", "--file", str(path)) == 0
+    assert [s["commentary"] for s in setup.sends] == ["Hello world."]
+
+
 # -------------------------------------------------------------------- --retry
 
 def test_retry_takes_over_a_stale_claim_and_keeps_the_old_one_as_evidence(setup, monkeypatch):
@@ -559,7 +621,12 @@ def test_a_claim_without_content_is_read_by_its_age(setup):
 
 # ------------------------------------------------- notes never mask an outcome
 
-NOTES = ["stranded", "approval-missing", "approval-mismatch", "claim-unresolved"]
+NOTES = ["stranded", "approval-missing", "approval-mismatch", "claim-unresolved",
+         "measured", "measure-failed", "check-failed", "precheck"]
+
+
+def test_every_note_stage_is_covered_by_the_tests_below():
+    assert set(NOTES) == set(queue.NOTE_STAGES)
 
 
 @pytest.mark.parametrize("note", NOTES)

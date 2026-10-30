@@ -112,6 +112,19 @@ def keys(cfg: Config) -> list[str]:
         return []
 
 
+def held_for_file(cfg: Config, file_name: str) -> bool:
+    """Whether any claim, under any content key, names this file. Retired claims do not count.
+
+    A claim is found by the hash of the text it was taken for. A post whose text changed after
+    an attempt has another hash and so no claim of its own, while the claim of the attempt still
+    names the same file. A claim whose content cannot be read names no file."""
+    for key in keys(cfg):
+        claim = read(cfg, key)
+        if claim is not None and claim.file == file_name:
+            return True
+    return False
+
+
 def _parse_time(value: object) -> dt.datetime | None:
     if not isinstance(value, str):
         return None
