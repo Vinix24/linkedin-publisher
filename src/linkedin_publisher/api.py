@@ -44,8 +44,9 @@ class PreflightRejected(PublisherError):
 class PublishUncertain(PublisherError):
     """LinkedIn may have created the post, but there is no clear answer.
 
-    A timeout, a lost connection, a server error, or a success without a post id.
-    Retrying automatically could post the same text twice, so the tool never does."""
+    A timeout, a lost connection, a server error, a success without a usable post id, or any other
+    answer that is neither a success nor a clear refusal. Retrying automatically could post the same
+    text twice, so the tool never does."""
 
 
 # ------------------------------------------------------------------ credentials
@@ -382,20 +383,37 @@ def publish(cfg: Config, creds: dict[str, str], tokens: dict[str, Any], commenta
         raise PublisherError(f"LinkedIn no longer accepts API version {api_version(cfg, creds)}. "
                              "Set a newer LINKEDIN_API_VERSION (format YYYYMM) in your .env. "
                              f"Response: {resp.text}")
+    if 400 <= resp.status_code < 500:
+        raise PublisherError(f"LinkedIn refused the post ({resp.status_code}): {resp.text}")
     if resp.status_code >= 500:
         raise PublishUncertain(f"LinkedIn answered with a server error ({resp.status_code}). "
                                "The post may be live.")
     if resp.status_code not in (200, 201):
-        raise PublisherError(f"LinkedIn refused the post ({resp.status_code}): {resp.text}")
-    urn = resp.headers.get("x-restli-id") or ""
-    if not urn and resp.text:
-        try:
-            urn = resp.json().get("id", "")
-        except ValueError:
-            urn = ""
+        raise PublishUncertain(f"LinkedIn answered with status {resp.status_code}, which is neither a success "
+                               "nor a refusal. The post may be live.")
+    urn = _post_id(resp)
     if not urn:
         raise PublishUncertain("LinkedIn accepted the post but returned no id. It is probably live.")
     return urn
+
+
+def _post_id(resp: requests.Response) -> str:
+    """The id of the new post in a successful answer, or "" when there is none that can be used.
+
+    The header wins. In the body only a JSON object with a non-empty string ``id`` counts. A body
+    that is a list, a string or a number is no id and not an error: the post is probably live, and the
+    caller must treat the answer as unclear instead of as a failure."""
+    header = resp.headers.get("x-restli-id")
+    if header:
+        return header
+    if not resp.text:
+        return ""
+    try:
+        body = resp.json()
+    except ValueError:
+        return ""
+    identifier = body.get("id") if isinstance(body, dict) else None
+    return identifier if isinstance(identifier, str) else ""
 
 
 def verify_online(cfg: Config) -> str:

@@ -31,11 +31,11 @@ reminder every 15 minutes. The posting itself stays a deliberate step.
 **Posting twice is worse than not posting.** Every attempt leaves a local receipt: one just
 before the post is sent, one with the outcome, both before the file is moved. A post that
 went live is never offered again, not even after a failed move or a renamed file. And when
-LinkedIn's answer is unclear (a timeout, a server error, or a success without a post id),
-the tool does not try again by itself. It tells you to check LinkedIn first. Receipts are
-read first and written later, so two runs that start in the same second could both pass
-them. Before anything is sent, a run therefore takes a *claim* on the post, a file that only
-one run can create. See *One post, one claim*.
+LinkedIn's answer is unclear (a timeout, a server error, a success without a usable post id,
+or any answer that is neither a success nor a refusal), the tool does not try again by itself.
+It tells you to check LinkedIn first. Receipts are read first and written later, so two runs
+that start in the same second could both pass them. Before anything is sent, a run therefore
+takes a *claim* on the post, a file that only one run can create. See *One post, one claim*.
 
 ## What it does and does not do
 
