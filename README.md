@@ -44,8 +44,9 @@ takes a *claim* on the post, a file that only one run can create. See *One post,
 | Text posts | Several images in one post |
 | One image per post, with required alt text | Captions and a custom thumbnail for a video |
 | One MP4 video per post, up to 500 MB | Polls |
-| One PDF per post (a document or carousel), up to 100 MB and 300 pages | Posting as a company page |
+| One PDF per post (a document or carousel), up to 100 MB and 300 pages | A first comment under a post as a company page |
 | Posting as yourself (your personal profile) | Scheduling inside LinkedIn itself |
+| Posting as a company page you have a role on (needs the optional community app) | |
 | Markdown in your files (converted to plain text) | Pinning a comment (the API has no call for it) |
 | Hashtags | Comments under other people's posts |
 | Private notes below the post that are never sent | |
@@ -130,7 +131,7 @@ it expires, so it does not surprise you on the morning you want to post.
 
 The first comment (see *First comment*) goes out with a second token, from a second app that
 has the Community Management API. That API is not self-serve: LinkedIn reviews every request.
-Posting keeps running on the main token.
+Posting as yourself keeps running on the main token. Posting as a company page runs on this one.
 
 ### Who can get it, and why a second app
 
@@ -179,6 +180,39 @@ something runs.
    different member is refused. The same member has a different `urn:li:person` id on each app,
    so the tool compares the two logins by name and you do not need to compare the urns by hand.
    `refresh --app community` works like `refresh`.
+
+### Post as a company page
+
+A post can go out as a LinkedIn Page instead of as you, with the community token. This has not been
+tested on the Development Tier yet, so LinkedIn may refuse it there.
+
+1. The community app needs the `w_organization_social` scope, and your member account needs a role on
+   the Page that may post for it: administrator, content administrator or direct sponsored content
+   poster ([Posts API, Permissions](https://learn.microsoft.com/en-us/linkedin/marketing/community-management/shares/posts-api),
+   [Organization Access Control](https://learn.microsoft.com/en-us/linkedin/marketing/community-management/organizations/organization-access-control-by-role)).
+   The tool does not check the role. Without one LinkedIn refuses the post and nothing goes out.
+2. Name the page in `publisher.toml`. The number is the id of the Page, the one in the address of its
+   admin view. A page without `[community]` is a config error.
+   ```toml
+   [community]
+
+   [pages.acme]
+   organization = "urn:li:organization:123456"
+   ```
+3. Run `linkedin-publisher auth --app community` again. With a page configured it also asks for
+   `w_organization_social`. Until then `status` and `precheck` say that the token lacks it.
+4. Put `author: acme` in the frontmatter of the post. Without `author` the post goes out as you,
+   exactly as before. A name that is not configured refuses the post: `precheck` reports it and
+   `publish` never sends it.
+
+- The approval key covers the page, by its organization URN. Moving a post from you to a page, or to
+  another page, voids the approval. A post without `author` keeps the key it had.
+- Receipts and claims know a page post by its text and its organization URN. The same text can go out
+  once as you and once on each page. Giving the page another name in the config does not post it twice.
+- The image, video or PDF of a page post is uploaded with the page as its owner.
+- A page post cannot have a first comment (the token would place it as you): it is refused.
+- `due`, `precheck` and a dry run show `as page acme`, and `precheck --json` adds `"author": "acme"`.
+  `status` lists the pages.
 
 ## First comment
 

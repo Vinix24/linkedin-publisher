@@ -50,6 +50,10 @@ def approval_key(post: queue.Post, cfg: Config) -> str:
     and so is its delay when the post has a comment and the delay is not zero.
     A post without a comment is hashed exactly as before.
 
+    A page post (``author``) has the page it goes out as in the key, by its organization URN: switching it
+    from the member to a page, or to another page, voids the approval. A post without ``author`` is hashed
+    exactly as before.
+
     A post with a measure line is hashed with the digits of the measured number replaced by a
     fixed token, and the measure line and the place of the number are parts of their own. A
     post without one is hashed exactly as before. Raises MeasureLineError when the measure
@@ -71,6 +75,9 @@ def approval_key(post: queue.Post, cfg: Config) -> str:
         part("measure_line", line.template.encode("utf-8"))
         part("measure_at", str(found.start(1)).encode("ascii"))
     part("format", post.meta.get("format", "text").encode("utf-8"))
+    author = queue.author_of(post, cfg)
+    if author:
+        part("author", author.encode("utf-8"))   # only for a page post: a post as the member hashes as before
     if out.image:
         part("alt_text", (out.alt_text or "").encode("utf-8"))
     if post.comment:
@@ -155,7 +162,7 @@ def approve(cfg: Config, path: Path, by: str, now: dt.datetime | None = None) ->
     problem = queue.content_problem(post, cfg)
     if problem:
         raise PublisherError(f"{path.name}: {problem}")
-    if queue.content_key(queue.post_text(post.body, cfg.notes_headings)) in queue.load_placed_keys(cfg):
+    if queue.post_key(post, cfg) in queue.load_placed_keys(cfg):
         raise PublisherError(f"{path.name}: a receipt shows this was already posted.")
     try:
         key = approval_key(post, cfg)

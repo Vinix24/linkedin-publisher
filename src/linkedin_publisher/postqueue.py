@@ -140,6 +140,29 @@ def content_key(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def page_name(post: Post) -> str:
+    """The page named in the ``author`` field, or "" for a post that goes out as the member."""
+    return (post.meta.get("author") or "").strip()
+
+
+def author_of(post: Post, cfg: Config) -> str | None:
+    """Who a post goes out as: None for the member, the organization URN for a configured page, and
+    ``page:<name>`` for a name the configuration does not know (``content_problem`` refuses that post)."""
+    name = page_name(post)
+    return (cfg.pages.get(name) or f"page:{name}") if name else None
+
+
+def post_key(post: Post, cfg: Config) -> str:
+    """The identity of a post in the receipts and the claims: its text, and for a page post its page too.
+
+    A post without ``author`` has the key of its text alone, as before pages existed, so its receipts still
+    count. A page post adds the organization URN, not the name: the same text may go out once as the member
+    and once on each page, and renaming the page in the configuration cannot post it twice on the same page."""
+    text = post_text(post.body, cfg.notes_headings)
+    author = author_of(post, cfg)
+    return content_key(text if author is None else f"{author}\0{text}")
+
+
 def slot_datetime(meta: dict[str, str], cfg: Config) -> dt.datetime | None:
     raw_slot = meta.get("slot")
     if not raw_slot:
@@ -166,6 +189,12 @@ def content_problem(post: Post, cfg: Config) -> str | None:
         return "empty post text"
     if post.comment_path and not post.comment:
         return f"{post.comment_path.name} is empty. Write the first comment in it, or remove the file"
+    name = page_name(post)
+    if name and name not in cfg.pages:
+        return f"author: '{name}' is not a page in the configuration. Add [pages.{name}], or remove the author field"
+    if name and post.comment_path:
+        return (f"a post that goes out as a page has no first comment. Remove {post.comment_path.name}, "
+                "or remove the author field")
     if "comment_delay" in post.meta:
         try:
             parse_delay(post.meta["comment_delay"] or "")
@@ -250,7 +279,7 @@ def collect(cfg: Config, now: dt.datetime) -> tuple[list[Post], list[Post]]:
 
         # First and strongest check: a receipt that proves this text was placed.
         # This covers a post that went live but whose file could not be moved.
-        state = states.get(content_key(post_text(post.body, cfg.notes_headings)))
+        state = states.get(post_key(post, cfg))
         if state == "placed":
             post.reason = "a receipt shows this was already posted, file is ignored"
             skipped.append(post)
@@ -261,7 +290,7 @@ def collect(cfg: Config, now: dt.datetime) -> tuple[list[Post], list[Post]]:
             skipped.append(post)
             continue
 
-        if claims.exists(cfg, content_key(post_text(post.body, cfg.notes_headings))):
+        if claims.exists(cfg, post_key(post, cfg)):
             post.reason = ("a claim exists: another run is sending it, or an earlier run ended without "
                            "an outcome. Check LinkedIn. If the post is not there: "
                            f"linkedin-publisher publish --post --file {post.path} --retry")
@@ -377,7 +406,7 @@ def write_receipt(cfg: Config, stage: str, post: Post | None = None, *,
         "event": "linkedin_publish",
         "stage": stage,
         "file": post.path.name if post else file_name,
-        "content_key": content_key(post_text(post.body, cfg.notes_headings)) if post else key,
+        "content_key": post_key(post, cfg) if post else key,
         "timestamp": now.isoformat(),
         "post_urn": post_urn,
         "post_url": post_url,

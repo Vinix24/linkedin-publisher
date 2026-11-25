@@ -116,3 +116,15 @@ def test_status_shows_community_token_only_when_configured(community_cfg, capsys
     community_cfg.community_tokens_file.write_text('{"access_expires_at": "2999-01-01T00:00:00"}')
     cli.cmd_status(community_cfg)
     assert "Community access token valid" in capsys.readouterr().out
+
+
+def test_authorize_with_a_page_asks_for_the_page_scope_and_saves_it(community_cfg, login, monkeypatch):
+    community_cfg.config_path.write_text(community_cfg.config_path.read_text()
+                                         + '[pages.acme]\norganization = "urn:li:organization:1"\n')
+    cfg = load_config(str(community_cfg.config_path))
+    cfg.env_file.write_text(COMMUNITY_ENV)
+    monkeypatch.setattr(api.requests, "get", lambda url, **_: Reply(200, {"id": "me1"}))
+    api.authorize(cfg, lambda _m: None, "community")
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(login["urls"][0]).query)
+    assert query["scope"] == [COMMUNITY_SCOPES + " w_organization_social"]
+    assert api.has_page_scope(api.read_tokens(cfg, "community"))

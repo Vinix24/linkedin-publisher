@@ -24,7 +24,7 @@ MEDIA_MISSING = {
 
 @dataclass(frozen=True)
 class Problem:
-    kind: str       # approval-missing | approval-mismatch | measure-line | media | content | expired | blocked | comment | check-failed
+    kind: str       # approval-missing | approval-mismatch | measure-line | media | content | expired | blocked | comment | page | check-failed
     message: str    # what is wrong and what to do about it
     ref: str        # names this problem, so the same problem is not reported twice
 
@@ -56,7 +56,7 @@ def evaluate(cfg: Config, now: dt.datetime, days_ahead: int) -> list[PostReport]
         slot = queue.slot_datetime(post.meta, cfg)
         if post.meta.get("status") != cfg.ready_status or slot is None or slot <= now or slot.date() > last:
             continue
-        key = queue.content_key(queue.post_text(post.body, cfg.notes_headings))
+        key = queue.post_key(post, cfg)
         state = states.get(key)
         if state == "placed":
             continue
@@ -113,7 +113,13 @@ def problems_of(cfg: Config, post: queue.Post, slot: dt.datetime, key: str, stat
                        "claim exists. Check LinkedIn. If the post is not there: "
                        f"linkedin-publisher publish --post --file {path} --retry", "blocked"))
 
-    if post.comment:
+    name = queue.page_name(post)
+    if name in cfg.pages:
+        reason = api.page_problem(cfg, slot)
+        if reason:
+            problems.append(Problem("page", f"the post goes out as page {name}, but {reason}", "page"))
+
+    if post.comment and not name:      # a page post with a comment is refused as content above
         delay = approval.effective_delay(post, cfg)      # the token must still do when the comment is due
         reason = api.community_problem(cfg, slot + dt.timedelta(minutes=delay) if delay else dt.datetime.now())
         if reason:
