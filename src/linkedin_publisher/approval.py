@@ -37,6 +37,9 @@ def approval_key(post: queue.Post, cfg: Config) -> str:
     it either, because it is never sent. Everything is length-prefixed, so two different posts
     cannot produce the same bytes by moving text from one part to the next.
 
+    The first comment (``post.comment.md``) is part of what goes out: it is in the key when there is one.
+    A post without a comment is hashed exactly as before.
+
     A post with a measure line is hashed with the digits of the measured number replaced by a
     fixed token, and the measure line and the place of the number are parts of their own. A
     post without one is hashed exactly as before. Raises MeasureLineError when the measure
@@ -60,6 +63,8 @@ def approval_key(post: queue.Post, cfg: Config) -> str:
     part("format", post.meta.get("format", "text").encode("utf-8"))
     if out.image:
         part("alt_text", (out.alt_text or "").encode("utf-8"))
+    if post.comment:
+        part("comment", post.comment.encode("utf-8"))   # only when there is one: other posts hash as before
     if out.video or out.document:
         part("title", (out.title or "").encode("utf-8"))
     for label, media in (("image", out.image), ("video", out.video), ("document", out.document)):

@@ -10,7 +10,7 @@ import datetime as dt
 import shlex
 from dataclasses import dataclass, field
 
-from . import approval, checks, claims
+from . import api, approval, checks, claims
 from . import postqueue as queue
 from .config import Config
 
@@ -24,7 +24,7 @@ MEDIA_MISSING = {
 
 @dataclass(frozen=True)
 class Problem:
-    kind: str       # approval-missing | approval-mismatch | measure-line | media | content | expired | blocked | check-failed
+    kind: str       # approval-missing | approval-mismatch | measure-line | media | content | expired | blocked | comment | check-failed
     message: str    # what is wrong and what to do about it
     ref: str        # names this problem, so the same problem is not reported twice
 
@@ -97,6 +97,12 @@ def problems_of(cfg: Config, post: queue.Post, slot: dt.datetime, key: str, stat
             "blocked", "a scheduled run will not send it: an earlier attempt may have gone through, or a "
                        "claim exists. Check LinkedIn. If the post is not there: "
                        f"linkedin-publisher publish --post --file {path} --retry", "blocked"))
+
+    if post.comment:
+        reason = api.community_problem(cfg, dt.datetime.now())
+        if reason:
+            problems.append(Problem("comment", f"the post has a first comment, but {reason}. The post "
+                                               "would go out without its comment", "comment"))
 
     for failure in checks.run_all(checks.parse(post.meta.get(cfg.checks_field)), cfg.check_timeout_seconds):
         problems.append(Problem("check-failed", f"check failed, {failure.describe()}", f"check:{failure.ref}"))

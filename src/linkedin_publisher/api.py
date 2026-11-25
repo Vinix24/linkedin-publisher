@@ -22,6 +22,7 @@ TOKEN_URL = "https://www.linkedin.com/oauth/v2/accessToken"
 USERINFO_URL = "https://api.linkedin.com/v2/userinfo"
 ME_URL = "https://api.linkedin.com/v2/me"
 POSTS_URL = "https://api.linkedin.com/rest/posts"
+SOCIAL_ACTIONS_URL = "https://api.linkedin.com/rest/socialActions"
 IMAGES_URL = "https://api.linkedin.com/rest/images"
 VIDEOS_URL = "https://api.linkedin.com/rest/videos"
 VIDEO_READY_SECONDS = 15 * 60
@@ -490,6 +491,76 @@ def _post_id(resp: requests.Response) -> str:
         return ""
     identifier = body.get("id") if isinstance(body, dict) else None
     return identifier if isinstance(identifier, str) else ""
+
+
+def community_problem(cfg: Config, now: dt.datetime | None = None) -> str | None:
+    """Why the community token cannot place a comment at ``now``, or None when it can.
+
+    It judges what placing the comment does (see ``ensure_access_token``). With a refresh token the access
+    token is renewed when it is within a day of expiring, so the refresh token must still be valid. Without
+    one, the access token must have more than a day left."""
+    if cfg.community_tokens_file is None:
+        return "the [community] section is missing from the configuration"
+    if not cfg.community_tokens_file.exists():
+        return f"there is no community token yet. Run: {auth_command('community')}"
+    now = now or dt.datetime.now()
+    try:
+        tokens = read_tokens(cfg, "community")
+        if not isinstance(tokens, dict):
+            raise ValueError("not a JSON object")
+        days = token_days_left(cfg, now, "community")
+        refresh_expires = tokens.get("refresh_expires_at")
+        refresh_ends = dt.datetime.fromisoformat(refresh_expires) if refresh_expires else None
+    except (OSError, ValueError) as exc:
+        return f"the community token file cannot be read ({exc}). Run: {auth_command('community')}"
+    if tokens.get("refresh_token"):
+        if refresh_ends is not None and refresh_ends <= now:
+            return f"the community refresh token has expired. Run: {auth_command('community')}"
+        return None
+    if days is None or days <= 1:
+        return f"the community token has expired or expires within a day, and there is no refresh token. Run: {auth_command('community')}"
+    return None
+
+
+def build_comment_payload(author: str, post_urn: str, text: str) -> dict[str, Any]:
+    """The JSON body for POST /rest/socialActions/{post urn}/comments. Pure, so it can be tested.
+
+    The text goes in as it is. A comment is plain text: Little Text Format escaping is for the
+    commentary of a post, and escaping here would show the backslashes."""
+    return {"actor": author, "object": post_urn, "message": {"text": text}}
+
+
+def comments_url(post_urn: str) -> str:
+    return f"{SOCIAL_ACTIONS_URL}/{urllib.parse.quote(post_urn, safe='')}/comments"
+
+
+def place_comment(cfg: Config, creds: dict[str, str], tokens: dict[str, Any], post_urn: str, text: str,
+                  url: str | None = None) -> str:
+    """Comment on a post with the community token. Returns the comment id.
+
+    Every answer that is neither a success nor a clear refusal raises PublishUncertain: the
+    comment may be there, and the caller never sends it a second time by itself."""
+    try:
+        resp = requests.post(url or comments_url(post_urn), headers={
+            "Authorization": f"Bearer {tokens['access_token']}",
+            "LinkedIn-Version": api_version(cfg, creds),
+            "X-Restli-Protocol-Version": "2.0.0",
+            "Content-Type": "application/json",
+        }, json=build_comment_payload(tokens["author_urn"], post_urn, text), timeout=60)
+    except requests.RequestException as exc:
+        raise PublishUncertain(f"No clear answer from LinkedIn ({exc}). The comment may be there.") from exc
+    if resp.status_code == 426:
+        raise PublisherError(f"LinkedIn no longer accepts API version {api_version(cfg, creds)}. "
+                             f"Set a newer LINKEDIN_API_VERSION (format YYYYMM) in your .env. Response: {resp.text}")
+    if 400 <= resp.status_code < 500:
+        raise PublisherError(f"LinkedIn refused the comment ({resp.status_code}): {resp.text}")
+    if resp.status_code not in (200, 201):
+        raise PublishUncertain(f"LinkedIn answered with status {resp.status_code}, which is neither a success "
+                               "nor a refusal. The comment may be there.")
+    comment_id = _post_id(resp)
+    if not comment_id:
+        raise PublishUncertain("LinkedIn accepted the comment but returned no id. It is probably there.")
+    return comment_id
 
 
 def verify_online(cfg: Config) -> str:

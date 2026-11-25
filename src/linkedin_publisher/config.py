@@ -19,7 +19,8 @@ FIELD_OPTIONS = (("approved_by_field", "approved_by"), ("approved_at_field", "ap
                  ("measure_line_field", "measure_line"), ("checks_field", "checks"))
 # Names the tool itself reads or writes in a post file. A field of ours must not be one of them.
 RESERVED_FIELDS = {"status", "slot", "slot_time", "format", "alt_text", "video_title",
-                   "document_title", "posted_date", "linkedin_url"}
+                   "document_title", "posted_date", "linkedin_url", "comment_status",
+                   "comment_urn", "comment_error"}
 
 
 COMMUNITY_SCOPES = ("r_basicprofile w_member_social w_member_social_feed "
