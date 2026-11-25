@@ -358,7 +358,8 @@ def report_unresolved_claims(cfg: Config, now: dt.datetime, log) -> int:
         claim = claims.read(cfg, key)
         if claim is None or moment - claim.claimed_at <= limit:
             continue
-        comment_key = key.removeprefix("comment-") if key.startswith("comment-") else None
+        link = key.startswith("link-comment-")       # a comment from a link: its claim names its receipt key
+        comment_key = claim.file if link else key.removeprefix("comment-") if key.startswith("comment-") else None
         if comment_key and has_comment_outcome_since(cfg, comment_key, claim.claimed_at):
             continue
         ref = claim.claimed_at.isoformat()
@@ -367,7 +368,11 @@ def report_unresolved_claims(cfg: Config, now: dt.datetime, log) -> int:
         name = claim.file or key[:12]
         minutes = int((moment - claim.claimed_at).total_seconds() // 60)
         queue.write_receipt(cfg, "claim-unresolved", key=key, file_name=claim.file, ref=ref)
-        if comment_key:
+        if link:
+            title = "LinkedIn comment: claimed but no outcome"
+            advice = ("It will not be sent again by itself. Read it back with linkedin-publisher comment ... "
+                      "--verify. If a person checked it is not there, run the same command with --retry-unclear")
+        elif comment_key:
             title = "LinkedIn first comment: claimed but no outcome"
             advice = ("It will not be placed again by itself. Check LinkedIn. If the comment is not there: "
                       "linkedin-publisher publish --comment-retry --file <the published post>")
@@ -1062,6 +1067,12 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     except requests.RequestException as exc:
         print(f"ERROR: could not reach LinkedIn: {exc}", file=sys.stderr)
+        return 1
+    except OSError as exc:      # after RequestException, which is an OSError too
+        if command != "comment":
+            raise
+        print(f"ERROR: {exc}", file=sys.stderr)
+        linkcomment.error_line(str(exc))
         return 1
 
 

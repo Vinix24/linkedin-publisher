@@ -426,7 +426,8 @@ COMMENT_STAGES = frozenset({"comment-attempt", "comment-placed", "comment-failed
 # A scheduled comment is a note about the future, not an outcome: it never counts as placed or attempted.
 NOTE_STAGES = frozenset({"stranded", "approval-missing", "approval-mismatch", "claim-unresolved",
                          "measured", "measure-failed", "check-failed", "precheck",
-                         "comment-scheduled", "page-problem", "comment-retry"}) | COMMENT_STAGES
+                         "comment-scheduled", "page-problem", "comment-retry",
+                         "comment-claim-recovered"}) | COMMENT_STAGES
 
 
 def _receipt_rows(cfg: Config):

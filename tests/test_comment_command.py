@@ -1,7 +1,10 @@
 """The comment command: the digest first, then the link, then one request. Nothing leaves this machine."""
+import datetime as dt
 import json
 import os
 import re
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -194,15 +197,44 @@ def test_after_an_unclear_attempt_only_retry_unclear_sends_again(lp, capsys, lef
     assert run(lp, capsys, *ARGS, "--retry-unclear")[0] == 0 and lp.calls == [("comment", ACTIVITY, TEXT)]
     assert stages(lp) == [left, "comment-retry", "comment-attempt", "comment-placed"]
     code, out = run(lp, capsys, *ARGS, "--retry-unclear")
-    assert code == 2 and "latest receipt here is comment-placed" in out["error"] and len(lp.calls) == 1
+    assert code == 2 and "placed here already" in out["error"] and len(lp.calls) == 1
 
 
-@pytest.mark.parametrize("left", [None, "comment-failed"])
-def test_retry_unclear_needs_an_unclear_attempt(lp, capsys, left):
-    if left:
-        linkcomment.receipt(lp.cfg, left, links.parse_target(POST_LINK), DIGEST)
-    code, out = run(lp, capsys, *ARGS, "--retry-unclear")
-    assert (code, lp.calls) == (2, []) and "only for an unclear earlier attempt" in out["error"]
+@pytest.mark.parametrize("flag", [(), ("--retry-unclear",)])
+@pytest.mark.parametrize("history, plain, retry", [
+    ([], 0, 2),
+    (["comment-failed"], 0, 2),                                     # the token failed: nothing was sent
+    (["comment-attempt", "comment-failed"], 0, 2),                  # a clear refusal: nothing was sent
+    (["comment-attempt"], 2, 0), (["comment-retry"], 2, 0), (["comment-uncertain"], 2, 0),
+    (["comment-attempt", "comment-uncertain", "comment-retry", "comment-failed"], 2, 0),       # retry: token failed
+    (["comment-attempt", "comment-uncertain", "comment-retry", "comment-attempt", "comment-failed"], 2, 0),  # retry: 4xx
+    (["comment-placed"], 2, 2), (["comment-uncertain", "comment-retry", "comment-attempt", "comment-placed"], 2, 2),
+])
+def test_the_whole_history_decides_not_the_latest_receipt(lp, capsys, history, plain, retry, flag):
+    for stage in history:
+        linkcomment.receipt(lp.cfg, stage, links.parse_target(POST_LINK), DIGEST)
+    code = run(lp, capsys, *ARGS, *flag)[0]
+    assert code == (retry if flag else plain) and len(lp.calls) == (code == 0)
+
+
+@pytest.mark.parametrize("retry_fails", ["token", "4xx"])
+def test_a_failed_retry_does_not_open_plain_sending(lp, capsys, monkeypatch, retry_fails):
+    def answer(result):
+        monkeypatch.setattr(api, "place_comment", lambda *_a, **_k: lp.calls.append("sent") or (
+            raising(result)() if isinstance(result, Exception) else result))
+
+    answer(api.PublishUncertain("timeout"))
+    assert run(lp, capsys, *ARGS)[0] == 3
+    if retry_fails == "token":
+        lp.cfg.community_tokens_file.unlink()
+    else:
+        answer(api.PublisherError("LinkedIn refused the comment (400): no"))
+    assert run(lp, capsys, *ARGS, "--retry-unclear")[0] == 2
+    lp.cfg.community_tokens_file.write_text(json.dumps(TOKENS))
+    answer("901")
+    code, out = run(lp, capsys, *ARGS)                  # the unattended job after a person's one retry
+    assert code == 2 and "may have gone through" in out["error"]
+    assert lp.calls == ["sent"] * (1 if retry_fails == "token" else 2)
 
 
 def test_two_unclear_runs_send_once(lp, capsys, monkeypatch):
@@ -217,7 +249,7 @@ def test_a_placed_receipt_that_cannot_be_written_still_refuses_a_rerun(lp, capsy
         raising(OSError("disk full"))() if stage == "comment-placed" else real(cfg, stage, *a, **k)))
     assert run(lp, capsys, *ARGS)[0] == 0
     code, out = run(lp, capsys, *ARGS)
-    assert code == 2 and "may have gone through (comment-attempt)" in out["error"] and len(lp.calls) == 1
+    assert code == 2 and "may have gone through" in out["error"] and len(lp.calls) == 1
 
 
 def test_an_overlapping_run_is_kept_out_by_the_claim(lp, capsys, monkeypatch):
@@ -245,6 +277,62 @@ def test_a_claim_of_a_live_process_keeps_out_a_retry_too(lp, capsys):
     assert lp.calls == [] and stages(lp) == [] and claims.exists(lp.cfg, ckey)
 
 
+def dead_claim(setup, on=POST_LINK):
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait()
+    ckey = linkcomment.claim_key(links.parse_target(on), DIGEST)
+    assert claims.take(setup.cfg, ckey, "x")
+    path = claims.claim_path(setup.cfg, ckey)
+    claimed_at = (dt.datetime.now(dt.UTC) - dt.timedelta(minutes=1)).isoformat()
+    path.write_text(json.dumps({"pid": child.pid, "file": linkcomment.receipt_key(links.parse_target(on), DIGEST),
+                                "claimed_at": claimed_at}))
+    return path
+
+
+def test_a_dead_claim_with_nothing_sent_after_it_is_taken_over_by_a_plain_run(lp, capsys):
+    path = dead_claim(lp)
+    before = path.read_bytes()
+    code, out = run(lp, capsys, *ARGS, "--retry-unclear")
+    assert (code, lp.calls) == (2, []) and "only for an unclear" in out["error"]
+    assert path.read_bytes() == before                  # a refused run leaves a claim it did not take alone
+    assert run(lp, capsys, *ARGS)[0] == 0 and len(lp.calls) == 1 and not path.exists()
+    assert stages(lp) == ["comment-claim-recovered", "comment-attempt", "comment-placed"]
+
+
+def test_a_dead_claim_with_an_attempt_after_it_waits_for_a_person(lp, capsys):
+    path = dead_claim(lp)
+    linkcomment.receipt(lp.cfg, "comment-attempt", links.parse_target(POST_LINK), DIGEST)
+    before = path.read_bytes()
+    code, out = run(lp, capsys, *ARGS)
+    assert (code, lp.calls) == (2, []) and "claim" in out["error"] and path.read_bytes() == before
+    assert run(lp, capsys, *ARGS, "--retry-unclear")[0] == 0 and len(lp.calls) == 1
+    assert stages(lp) == ["comment-attempt", "comment-retry", "comment-attempt", "comment-placed"]
+
+
+def age(setup, path, minutes):
+    path.write_text(json.dumps(json.loads(path.read_text()) | {
+        "claimed_at": (dt.datetime.now(dt.UTC) - dt.timedelta(minutes=minutes)).isoformat()}))
+
+
+def test_a_claim_that_cannot_be_removed_keeps_placed_and_is_reported_as_a_comment(lp, capsys, monkeypatch):
+    real_release = claims.release
+    monkeypatch.setattr(claims, "release", raising(OSError("read-only")))
+    code = lp.run("comment", *ARGS)
+    out, err = capsys.readouterr()
+    assert code == 0 and json.loads(out)["comment_urn"] == f"urn:li:comment:({ACTIVITY},901)"
+    assert "could not be removed" in err
+    monkeypatch.setattr(claims, "release", real_release)
+    age(lp, claims.claim_path(lp.cfg, linkcomment.claim_key(links.parse_target(POST_LINK), DIGEST)), 120)
+    assert lp.run("publish", "--notify") == 0           # placed after the claim: nothing to report
+    unresolved = dead_claim(lp, COMMENT)                # a claim of an answer with no receipt at all
+    age(lp, unresolved, 120)
+    capsys.readouterr()
+    assert lp.run("publish", "--notify") == 3
+    log = capsys.readouterr().out
+    assert "--verify" in log and "--retry-unclear" in log and "--post --file" not in log
+    assert stages(lp)[-1] == "claim-unresolved"
+
+
 def test_every_failure_ends_in_the_json_line(lp, capsys, monkeypatch, tmp_path):
     lp.cfg.community_tokens_file.write_text(json.dumps({k: v for k, v in TOKENS.items() if k != "access_token"}))
     code, out = run(lp, capsys, *ARGS)
@@ -258,8 +346,9 @@ def test_every_failure_ends_in_the_json_line(lp, capsys, monkeypatch, tmp_path):
     (lp.cfg.receipts_dir / "2026-01-01.ndjson").write_bytes(b"\xff\xfe not UTF-8\n")
     code, out = run(lp, capsys, *ARGS)
     assert (code, out["status"]) == (1, "error") and "UnicodeDecodeError" in out["error"] and lp.calls == []
-    assert cli.main(["--config", str(tmp_path / "missing.toml"), "comment", *ARGS]) == 1
-    assert json.loads(capsys.readouterr().out)["status"] == "error"
+    for config in (tmp_path / "missing.toml", tmp_path):           # a folder is an OSError, not a ConfigError
+        assert cli.main(["--config", str(config), "comment", *ARGS]) == 1
+        assert json.loads(capsys.readouterr().out)["status"] == "error"
 
 
 @pytest.mark.parametrize("extra", [(), ("--verify",), ("--retry-unclear",)])

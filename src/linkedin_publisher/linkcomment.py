@@ -18,12 +18,11 @@ from . import api, claims, links
 from . import postqueue as queue
 from .api import PublisherError, PublishUncertain, refuse_in_a_test_run
 from .config import Config
-from .firstcomment import FINISHED_STAGES
 from .textdigest import normalize_text, text_digest
 
 EXIT_CODES = {"placed": 0, "found": 0, "dry-run": 0, "error": 1, "refused": 2, "uncertain": 3, "not-found": 4,
               "unverifiable": 5}
-UNCLEAR_STAGES = ("comment-attempt", "comment-uncertain")
+SENDS = ("comment-attempt", "comment-retry")
 
 
 class Unverifiable(PublisherError):
@@ -168,39 +167,87 @@ def read_back(cfg: Config, target: links.Target, digest: str) -> dict[str, Any]:
     return {"status": "not-found"}
 
 
+def unclear(stages: list[str]) -> bool:
+    """An uncertain answer anywhere in the history, or an attempt or retry with no outcome after it."""
+    open_send = False
+    for stage in stages:
+        if stage in SENDS:
+            open_send = True
+        elif stage in queue.COMMENT_OUTCOMES:
+            open_send = False
+    return open_send or "comment-uncertain" in stages
+
+
+def refusal(stages: list[str], retry_unclear: bool) -> str | None:
+    """Why this run may not send, decided on the whole history of this text on this target, never on its last
+    receipt: a failed retry must not open plain sending again. None when it may send."""
+    if "comment-placed" in stages:
+        return "a receipt shows this text was placed here already. Nothing was sent."
+    if retry_unclear and not unclear(stages):
+        return "--retry-unclear is only for an unclear earlier attempt, and there is none here. Nothing was sent."
+    if not retry_unclear and unclear(stages):
+        return ("an earlier attempt may have gone through. Nothing was sent. Read it back with --verify. "
+                "If a person checked it is not there, add --retry-unclear.")
+    return None
+
+
+def stages_of(cfg: Config, target: links.Target, digest: str) -> list[str]:
+    return [row.get("stage") for row in queue.rows_of(cfg, receipt_key(target, digest))]
+
+
 def place(cfg: Config, target: links.Target, body: str, digest: str, retry_unclear: bool = False) -> dict[str, Any]:
     """One request, under a claim, which only one of two overlapping runs gets. The claim covers the step from
     the receipt check to the attempt receipt. After an outcome receipt the receipts guard the comment, so the
-    claim is removed; a run that dies mid-request leaves it, and only --retry-unclear takes it over."""
+    claim is removed. A run that dies leaves it (see take_over)."""
     key, ckey = receipt_key(target, digest), claim_key(target, digest)
-    if not claims.take(cfg, ckey, f"comment on {target.urn}"):
-        if not retry_unclear:
-            raise PublisherError("another run holds the claim for this comment, or one ended without an outcome. "
-                                 "Nothing was sent. Read it back with --verify.")
-        try:
-            claims.supersede(cfg, ckey, lambda: queue.load_comment_states(cfg).get(key) != "comment-placed")
-        except claims.ClaimHeld as exc:
-            raise PublisherError(f"the comment is not sent. {exc}") from exc
-        if not claims.take(cfg, ckey, f"comment on {target.urn}"):
+    if not claims.take(cfg, ckey, key):
+        take_over(cfg, target, digest, ckey, retry_unclear)
+        if not claims.take(cfg, ckey, key):
             raise PublisherError("the comment is not sent. Another run claimed it first.")
     try:
         return place_claimed(cfg, target, body, digest, retry_unclear)
     finally:
-        claims.release(cfg, ckey)
+        try:
+            claims.release(cfg, ckey)
+        except OSError as exc:
+            say(f"WARNING: the claim could not be removed ({exc}). The receipts still guard this comment.")
+
+
+def take_over(cfg: Config, target: links.Target, digest: str, ckey: str, retry_unclear: bool) -> None:
+    """A claim is there: a run that is sending, or one that died. This is decided before the claim is touched,
+    so a refused run leaves it as it is. A plain run takes over a dead claim only when no attempt or retry was
+    written after it was taken: nothing was sent, and a comment-claim-recovered note says so. --retry-unclear
+    takes over one whose history is unclear. A claim whose process still runs is never taken over."""
+    holder = claims.read(cfg, ckey)
+    if holder is None:
+        return
+
+    def reason() -> str | None:
+        rows = queue.rows_of(cfg, receipt_key(target, digest))
+        why = refusal([row.get("stage") for row in rows], retry_unclear)
+        if why is None and not retry_unclear and any(
+                row.get("stage") in SENDS and queue.written_since(row, holder.claimed_at) for row in rows):
+            why = "the run that holds it may have sent it. Nothing was sent. Read it back with --verify."
+        return why
+
+    why = reason()
+    if why:
+        raise PublisherError(f"another run holds the claim for this comment, or one ended without an outcome: {why}")
+    try:
+        claims.supersede(cfg, ckey, lambda: reason() is None)
+    except claims.ClaimHeld as exc:
+        raise PublisherError(f"the comment is not sent. {exc}") from exc
+    if not retry_unclear:
+        receipt(cfg, "comment-claim-recovered", target, digest,
+                error=f"the run that claimed it at {holder.claimed_at.isoformat()} ended before it sent anything")
 
 
 def place_claimed(cfg: Config, target: links.Target, body: str, digest: str, retry_unclear: bool) -> dict[str, Any]:
-    """After an attempt, an unclear answer or a placed comment for this text and target (FINISHED_STAGES, as for a
-    first comment) nothing is sent again. --retry-unclear is a person's word that an unclear one is not there."""
-    state = queue.load_comment_states(cfg).get(receipt_key(target, digest))
-    if retry_unclear and state not in UNCLEAR_STAGES:
-        raise PublisherError(f"--retry-unclear is only for an unclear earlier attempt, and the latest receipt here "
-                             f"is {state or 'none'}. Nothing was sent.")
-    if state == "comment-placed":
-        raise PublisherError("a receipt shows this text was placed here already. Nothing was sent.")
-    if state in FINISHED_STAGES and not retry_unclear:
-        raise PublisherError(f"an earlier attempt may have gone through ({state}). Nothing was sent. Read it back "
-                             "with --verify. If a person checked it is not there, add --retry-unclear.")
+    """Asks refusal again, now that the claim is held. --retry-unclear is a person's word that an unclear
+    comment is not there."""
+    why = refusal(stages_of(cfg, target, digest), retry_unclear)
+    if why:
+        raise PublisherError(why)
     if retry_unclear:
         receipt(cfg, "comment-retry", target, digest, strict=True)
     try:
@@ -231,7 +278,8 @@ def receipt_key(target: links.Target, digest: str) -> str:
 
 
 def claim_key(target: links.Target, digest: str) -> str:
-    """The receipt key hashed: a plain file name."""
+    """The receipt key hashed: a plain file name. The claim names the receipt key itself as its file, so a
+    scheduled run can find the receipts of a claim that outlives its run."""
     return "link-comment-" + hashlib.sha256(receipt_key(target, digest).encode("utf-8")).hexdigest()
 
 
