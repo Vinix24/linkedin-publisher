@@ -15,7 +15,7 @@ from typing import Any, Callable
 
 import requests
 
-from .config import Config
+from .config import PAGE_SCOPE, Config
 
 AUTH_URL = "https://www.linkedin.com/oauth/v2/authorization"
 TOKEN_URL = "https://www.linkedin.com/oauth/v2/accessToken"
@@ -257,6 +257,7 @@ def authorize(cfg: Config, log: Log = print, app: str = "main") -> str:
         "refresh_expires_at": (now + dt.timedelta(seconds=payload["refresh_token_expires_in"])).isoformat()
         if payload.get("refresh_token_expires_in") else "",
         "author_urn": author,
+        "scope": payload.get("scope") or scopes,     # what posting as a page is checked against
         "obtained_at": now.isoformat(),
     }, app)
     log(f"Tokens saved to {tokens_path(cfg, app)}. Author: {author}")
@@ -433,8 +434,9 @@ def publish(cfg: Config, creds: dict[str, str], tokens: dict[str, Any], commenta
             image: Path | None = None, alt_text: str | None = None,
             posts_url: str = POSTS_URL, video: Path | None = None, title: str | None = None,
             videos_url: str = VIDEOS_URL, document: Path | None = None,
-            documents_url: str = DOCUMENTS_URL) -> str:
-    """Post it. Returns the post URN."""
+            documents_url: str = DOCUMENTS_URL, author: str | None = None) -> str:
+    """Post it. Returns the post URN. ``author`` is the organization URN of a page post, which then
+    owns the media too; without it the post goes out as the member of the token."""
     from .littletext import find_unescaped
 
     leftover = find_unescaped(commentary)
@@ -450,7 +452,7 @@ def publish(cfg: Config, creds: dict[str, str], tokens: dict[str, Any], commenta
         "X-Restli-Protocol-Version": "2.0.0",
         "Content-Type": "application/json",
     })
-    author = tokens["author_urn"]
+    author = author or tokens["author_urn"]
     if len([media for media in (image, video, document) if media]) > 1:
         raise PublisherError("A post carries one image, one video or one document, never two of them.")
     if video:
@@ -529,6 +531,30 @@ def community_problem(cfg: Config, now: dt.datetime | None = None) -> str | None
     if days is None or days <= 1:
         return f"the community token has expired or expires within a day, and there is no refresh token. Run: {auth_command('community')}"
     return None
+
+
+def has_page_scope(tokens: dict[str, Any]) -> bool:
+    """Whether the token was granted the scope that posting as a page needs. LinkedIn documents the scope
+    of a token as space-delimited; a comma is accepted too. A token saved before 0.9.0 has no scope: no."""
+    return PAGE_SCOPE in str(tokens.get("scope", "")).replace(",", " ").split()
+
+
+def page_problem(cfg: Config, now: dt.datetime | None = None) -> str | None:
+    """Why the community token cannot post as a page at ``now``, or None when it can.
+
+    It follows the send path (``ensure_access_token``): an access token with more than a day left is used as
+    it is, so a refresh token that expired next to it does not hold the post yet. With a day or less left,
+    ``community_problem`` judges the token, as for a comment. A scheduled run asks this before it chooses its
+    post, so a token that cannot be checked at all is a problem here and never an exception: it holds the
+    page posts, and a post as the member still goes out."""
+    try:
+        days = token_days_left(cfg, now, "community")
+        problem = None if days is not None and days > 1 else community_problem(cfg, now)
+        if problem or has_page_scope(read_tokens(cfg, "community")):
+            return problem
+    except Exception as exc:        # a hand-edited time with a zone, a file gone between two reads, ...
+        return f"the community token cannot be checked ({exc}). Run: {auth_command('community')}"
+    return f"the community token was not granted {PAGE_SCOPE}. Run: {auth_command('community')}"
 
 
 def build_comment_payload(author: str, post_urn: str, text: str) -> dict[str, Any]:

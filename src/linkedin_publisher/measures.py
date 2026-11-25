@@ -102,7 +102,7 @@ def refusal(cfg: Config, post: queue.Post, slot: dt.datetime, now: dt.datetime) 
     different post as far as those guards can tell."""
     if now >= slot:
         return f"its slot ({slot:%Y-%m-%d %H:%M}) has been reached"
-    key = queue.content_key(queue.post_text(post.body, cfg.notes_headings))
+    key = queue.post_key(post, cfg)
     state = queue.load_states(cfg).get(key)
     if state == "placed":
         return "a receipt shows this text was already posted"

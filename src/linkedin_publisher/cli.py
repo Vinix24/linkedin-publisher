@@ -156,6 +156,12 @@ def cmd_status(cfg: Config, online: bool = False, fail_days: int | None = None) 
     print(token_line(cfg) or "No tokens yet. Run 'linkedin-publisher auth'.")
     if cfg.community_tokens_file is not None:
         print(token_line(cfg, "community") or f"No community tokens yet. Run '{api.auth_command('community')}'.")
+    for name, urn in cfg.pages.items():
+        print(f"page:      {name} ({urn})")
+    if cfg.pages:
+        problem = api.page_problem(cfg)
+        print("A post goes out as the member unless its author field names a page. "
+              + (f"Posting as a page will fail: {problem}." if problem else f"The community token has {api.PAGE_SCOPE}."))
     for line in scheduled_comment_lines(cfg):
         print(line)
     if online:
@@ -186,8 +192,8 @@ def cmd_due(cfg: Config, now: dt.datetime) -> None:
     if ready:
         print("Ready to post:")
         for post in ready:
-            print(f"  {post.path.name}  (slot {post.due:%Y-%m-%d %H:%M}, {post.meta.get('format', 'text')})"
-                  f"{approval_note(cfg, post)}")
+            print(f"  {post.path.name}  (slot {post.due:%Y-%m-%d %H:%M}, {post.meta.get('format', 'text')}"
+                  f"{page_note(post)}){approval_note(cfg, post)}")
             for check in checks.parse(post.meta.get(cfg.checks_field)):
                 print(f"      check, asked by a scheduled run: {check.line}")
     else:
@@ -195,13 +201,19 @@ def cmd_due(cfg: Config, now: dt.datetime) -> None:
     if skipped:
         print("\nSkipped:")
         for post in skipped:
-            print(f"  {post.path.name}: {post.reason}")
+            print(f"  {post.path.name}{page_note(post)}: {post.reason}")
     comment_lines = scheduled_comment_lines(cfg)
     if comment_lines:
         print("\n" + "\n".join(comment_lines))
     line = token_line(cfg)
     if line:
         print(f"\n{line}")
+
+
+def page_note(post) -> str:
+    """', as page NAME' for a post that goes out as a page. A post as the member shows nothing, as before."""
+    name = queue.page_name(post)
+    return f", as page {name}" if name else ""
 
 
 def approval_note(cfg: Config, post) -> str:
@@ -278,7 +290,7 @@ def cmd_approve(cfg: Config, path: Path, by: str) -> None:
         raise api.PublisherError(f"{path} does not exist.")
     key = approval.approve(cfg, path, by)
     print(f"Approved {path.name} as {by.strip()}.")
-    print(f"  key {key[:12]}, over the text, format, alt text, title and media as they are now.")
+    print(f"  key {key[:12]}, over the text, format, alt text, title, media and page as they are now.")
     print("  Change any of those and the approval no longer counts. Changing the slot does not.")
     if measures.line_of(queue.read_post(path), cfg):
         print("  The measured number in the measure line is not part of the key. Nothing else in the post may change.")
@@ -315,7 +327,7 @@ def report_new_stranded(cfg: Config, skipped: list, log) -> int:
     Returns 3 when there was something new to report, so a CI run turns red once."""
     known = queue.load_stranded_keys(cfg)
     new = [p for p in skipped if p.stranded
-           and queue.content_key(queue.post_text(p.body, cfg.notes_headings)) not in known]
+           and queue.post_key(p, cfg) not in known]
     for post in new:
         queue.write_receipt(cfg, "stranded", post)
         log(f"Missed its slot and was not posted late: {post.path.name}. "
@@ -395,7 +407,7 @@ def apply_approval(cfg: Config, ready: list, log) -> tuple[list, int]:
         problem = approval.measure_line_problem(post, cfg) if state == approval.MISMATCH else None
         if problem:
             title, template = MEASURE_LINE_NOTICE
-        key = queue.content_key(queue.post_text(post.body, cfg.notes_headings))
+        key = queue.post_key(post, cfg)
         if (key, current) in noted[stage]:
             continue
         noted[stage].add((key, current))
@@ -423,7 +435,7 @@ def apply_checks(cfg: Config, ready: list, log) -> tuple[list, int, int]:
         if not failures:
             return ready[index:], held, 3 if reported else 0
         held += 1
-        key = queue.content_key(queue.post_text(post.body, cfg.notes_headings))
+        key = queue.post_key(post, cfg)
         until = post.due + dt.timedelta(minutes=cfg.grace_minutes)
         for failure in failures:
             message = (f"{post.path.stem} (slot {post.due:%Y-%m-%d %H:%M}) was not sent. Check failed, "
@@ -438,6 +450,37 @@ def apply_checks(cfg: Config, ready: list, log) -> tuple[list, int, int]:
     return [], held, 3 if reported else 0
 
 
+PAGE_HELD_TITLE = "LinkedIn post held back: it cannot go out as the page"
+
+
+def drop_page_problems(cfg: Config, ready: list, now: dt.datetime, log) -> tuple[list, int]:
+    """Leave out the due page posts that the community token cannot send, before one post is chosen.
+
+    Without this a page post would be taken first and fail after its claim on every run, while a post as
+    the member due in the same window never went out. Each one left out gets a line in the log on every
+    run, and is reported once per problem with a note in the receipts and a notification.
+    Returns (the posts that remain, 3 when there was something new to report)."""
+    problem = api.page_problem(cfg, now) if any(queue.page_name(post) for post in ready) else None
+    if not problem:
+        return ready, 0
+    noted = queue.load_notes(cfg, "page-problem")
+    keep, reported = [], 0
+    for post in ready:
+        if not queue.page_name(post):
+            keep.append(post)
+            continue
+        message = f"{post.path.stem} goes out as page {queue.page_name(post)}, but {problem}"
+        log(f"Not posting {post.path.name}. {message}")
+        key = queue.post_key(post, cfg)
+        if (key, problem) in noted:
+            continue
+        noted.add((key, problem))
+        queue.write_receipt(cfg, "page-problem", post, ref=problem, error=problem)
+        alert(cfg, PAGE_HELD_TITLE, message)
+        reported += 1
+    return keep, 3 if reported else 0
+
+
 def media_line(post) -> str:
     fmt = post.meta.get("format", "text")
     if fmt in ("video", "document"):
@@ -450,10 +493,12 @@ def media_line(post) -> str:
     return f"image: {post.image.name if post.image else 'none'}"
 
 
-def held_back_line(unapproved: int, failing_checks: int, external: int = 0) -> str:
+def held_back_line(unapproved: int, failing_checks: int, external: int = 0, pages: int = 0) -> str:
     reasons = []
     if unapproved:
         reasons.append(f"{unapproved} without a valid approval")
+    if pages:
+        reasons.append(f"{pages} that cannot go out as their page")
     if failing_checks:
         reasons.append(f"{failing_checks} with a failing check")
     if not reasons:
@@ -502,7 +547,8 @@ def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None, ret
     receipt. The person hears about it through ``alert``, once per run.
 
     Returns 0, 1 for a run that could not do its work, or 3 when it found something new to
-    report (a missed slot, a claim without an outcome, a post that needs approval)."""
+    report (a missed slot, a claim without an outcome, a post that needs approval, a page post the
+    community token cannot send)."""
     if require_approval and not cfg.approval_required:
         alert(cfg, REQUIRE_APPROVAL_TITLE, REQUIRE_APPROVAL_MESSAGE)
         raise api.PublisherError(REQUIRE_APPROVAL_MESSAGE)
@@ -529,7 +575,7 @@ def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None, ret
         problem = queue.content_problem(post, cfg)
         if problem:
             raise api.PublisherError(f"{only.name}: {problem}")
-        key = queue.content_key(queue.post_text(post.body, cfg.notes_headings))
+        key = queue.post_key(post, cfg)
         if key in queue.load_placed_keys(cfg):
             raise api.PublisherError(f"{only.name}: a receipt shows this was already posted.")
         if key in queue.load_uncertain_keys(cfg) and not retry:
@@ -550,7 +596,7 @@ def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None, ret
         if mode in ("notify", "post"):
             report_code = report_new_stranded(cfg, skipped, log)
             report_code = report_unresolved_claims(cfg, now, log) or report_code
-        unapproved_count = check_held = external_count = 0
+        unapproved_count = check_held = external_count = page_held = 0
         if mode == "post" and cfg.approval_required:
             # Before anything is sent: a due post goes out only when a person approved this version.
             due_count = len(ready)
@@ -558,13 +604,19 @@ def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None, ret
             ready, unapproved = apply_approval(cfg, ready, log)
             report_code = report_code or unapproved
             unapproved_count = due_count - len(ready) - external_count
+        if mode in ("notify", "post"):
+            # Before one post is chosen: a page post the community token cannot send must not hold up the rest.
+            due_count = len(ready)
+            ready, page_report = drop_page_problems(cfg, ready, now, log)
+            page_held = due_count - len(ready)
+            report_code = report_code or page_report
         if mode == "post":
             # After the approval and before the claim: the addresses the post names must answer.
             ready, check_held, failed_checks = apply_checks(cfg, ready, log)
             report_code = report_code or failed_checks
         if not ready:
             if mode != "notify":
-                print(held_back_line(unapproved_count, check_held, external_count))
+                print(held_back_line(unapproved_count, check_held, external_count, page_held))
             return report_code
         post = ready[0]  # one post per run
         if len(ready) > 1:
@@ -583,6 +635,8 @@ def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None, ret
         print(f"DRY RUN {post.path.name} (slot {post.due:%Y-%m-%d %H:%M}){approval_note(cfg, post)}")
         print(f"characters: {len(commentary)} | format: {post.meta.get('format', 'text')} | "
               f"{media_line(post)}")
+        if queue.page_name(post):
+            print(f"goes out as page {queue.page_name(post)} ({queue.author_of(post, cfg)})")
         for check in checks.parse(post.meta.get(cfg.checks_field)):
             print(f"check, asked by a scheduled run: {check.line}")
         print("-" * 60)
@@ -604,7 +658,7 @@ def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None, ret
     # together. The claim is the step only one of them gets. It comes before the first call
     # to LinkedIn, the token refresh included, and before this run puts its own lock down:
     # a run that lost the claim must not remove the lock of the run that won it.
-    key = queue.content_key(text)
+    key = queue.post_key(post, cfg)
     if not take_claim(cfg, key, post.path, retry, log):
         return 1
     try:
@@ -615,14 +669,22 @@ def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None, ret
         raise
     try:
         try:
-            creds = api.load_credentials(cfg)
-            tokens = api.ensure_access_token(cfg, creds, api.read_tokens(cfg), log)
+            author = queue.author_of(post, cfg)      # a page URN or None: content_problem refused an unknown page
+            if author:      # a page posts with the community token
+                creds = api.load_credentials(cfg, "community")
+                tokens = api.ensure_access_token(cfg, creds, api.read_tokens(cfg, "community"), log, "community")
+                if not api.has_page_scope(tokens):
+                    raise api.PublisherError(f"{post.path.name} goes out as a page, but the community token was not "
+                                             f"granted {api.PAGE_SCOPE}. Run: {api.auth_command('community')}")
+            else:
+                creds = api.load_credentials(cfg)
+                tokens = api.ensure_access_token(cfg, creds, api.read_tokens(cfg), log)
             out = queue.outgoing(post)
             # Written before anything is sent. If the run dies while sending, the
             # next run sees an attempt without an outcome and will not retry.
             queue.write_receipt(cfg, "attempt", post)
             urn = api.publish(cfg, creds, tokens, commentary, out.image, out.alt_text,
-                              video=out.video, title=out.title, document=out.document)
+                              video=out.video, title=out.title, document=out.document, author=author)
         except api.PreflightRejected as exc:
             # Nothing was sent, so the claim goes, but only after the receipt says why.
             queue.write_receipt(cfg, "preflight-rejected", post, error=str(exc))
@@ -713,7 +775,7 @@ def measure_post(cfg: Config, path: Path, now: dt.datetime, last: dt.date, noted
         return 0
 
     text = queue.post_text(post.body, cfg.notes_headings)
-    key = queue.content_key(text)
+    key = queue.post_key(post, cfg)
     current = None
     started = time.monotonic()
     try:
@@ -746,7 +808,7 @@ def measure_post(cfg: Config, path: Path, now: dt.datetime, last: dt.date, noted
         approval.replace_file(path, original, updated.encode("utf-8"), what="measurement", command="measure")
     except api.PublisherError as exc:
         return report_measure_failure(cfg, post, key, slot, current, "write", str(exc), noted, log)
-    new_key = queue.content_key(queue.post_text(queue.parse_post(path, updated).body, cfg.notes_headings))
+    new_key = queue.post_key(queue.parse_post(path, updated), cfg)
     queue.write_receipt(cfg, "measured", key=new_key, file_name=path.name, ref=f"{current}->{digits}")
     log(f"Measured {path.name}: {current} -> {digits}.")
     return 0
@@ -815,7 +877,7 @@ def alert_precheck_problems(cfg: Config, now: dt.datetime, reports: list) -> Non
     noted = queue.load_notes(cfg, "precheck")
     day = now.date().isoformat()
     for report in reports:
-        key = queue.content_key(queue.post_text(report.post.body, cfg.notes_headings))
+        key = queue.post_key(report.post, cfg)
         for problem in report.problems:
             ref = f"{problem.ref}@{day}"
             if (key, ref) in noted:
@@ -831,6 +893,7 @@ def precheck_json(reports: list, days_ahead: int) -> dict:
         {"post": report.post.path.name, "slot_date": f"{report.slot:%Y-%m-%d}", "slot_time": f"{report.slot:%H:%M}",
          "route": report.route, "checked": report.checked,
          "problems": [{"kind": problem.kind, "message": problem.message} for problem in report.problems]}
+        | ({"author": queue.page_name(report.post)} if queue.page_name(report.post) else {})   # member posts keep their shape
         for report in reports]}
 
 
@@ -841,7 +904,7 @@ def print_precheck(reports: list, now: dt.datetime, days_ahead: int) -> None:
         print("No posts with a slot in this range.")
         return
     for report in reports:
-        head = f"{report.slot:%Y-%m-%d %H:%M}  {report.post.path.name}"
+        head = f"{report.slot:%Y-%m-%d %H:%M}  {report.post.path.name}{page_note(report.post)}"
         if not report.checked:
             print(f"{head}  route: external, not checked")
         elif not report.problems:

@@ -58,6 +58,9 @@ def place(cfg: Config, post: queue.Post, post_urn: str, record_path: Path, log, 
     if not post.comment:
         return None
     name = post.path.name
+    if queue.page_name(post):
+        return _failed(cfg, post, record_path, log, alert, "the comment was not sent: a post that goes out as a page "
+                                                          "has no first comment")
     problem = api.community_problem(cfg)
     if problem:
         return _failed(cfg, post, record_path, log, alert, f"the comment was not sent: {problem}")
@@ -102,7 +105,7 @@ def retry(cfg: Config, path: Path, log, alert: Alert) -> str:
     post = queue.read_post(path)
     if not post.comment:
         raise PublisherError(f"{path.name}: there is no {queue.comment_path_for(path).name} next to it.")
-    key = queue.content_key(queue.post_text(post.body, cfg.notes_headings))
+    key = queue.post_key(post, cfg)
     urn = queue.placed_urn(cfg, key)
     if not urn:
         raise PublisherError(f"{path.name}: no receipt shows this post was placed, so there is nothing to comment on.")
@@ -177,7 +180,7 @@ def scheduled(cfg: Config) -> list[Scheduled]:
             continue
         if post.meta.get("comment_status") != SCHEDULED:
             continue
-        key = queue.content_key(queue.post_text(post.body, cfg.notes_headings))
+        key = queue.post_key(post, cfg)
         if key in finished:
             continue
         try:

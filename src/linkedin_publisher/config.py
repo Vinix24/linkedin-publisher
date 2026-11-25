@@ -20,11 +20,14 @@ FIELD_OPTIONS = (("approved_by_field", "approved_by"), ("approved_at_field", "ap
 # Names the tool itself reads or writes in a post file. A field of ours must not be one of them.
 RESERVED_FIELDS = {"status", "slot", "slot_time", "format", "alt_text", "video_title",
                    "document_title", "posted_date", "linkedin_url", "comment_status",
-                   "comment_urn", "comment_error", "comment_delay", "comment_due"}
+                   "comment_urn", "comment_error", "comment_delay", "comment_due", "author"}
 
 
 COMMUNITY_SCOPES = ("r_basicprofile w_member_social w_member_social_feed "
                     "r_member_postAnalytics r_member_profileAnalytics")
+# Posting as a page. Asked for only when a page is configured, so a community login without pages keeps its scopes.
+PAGE_SCOPE = "w_organization_social"
+ORGANIZATION_RE = re.compile(r"urn:li:organization:[1-9][0-9]*")    # an id, so no leading zero
 
 
 DELAY_RE = re.compile(r"^(0|[1-9]\d*)([mh])$")
@@ -92,6 +95,7 @@ class Config:
     community_tokens_file: Path | None = None
     community_scopes: str = COMMUNITY_SCOPES
     comment_delay_minutes: int = 0
+    pages: dict[str, str] = field(default_factory=dict)     # page name -> organization URN
 
 
 def find_config(explicit: str | None) -> Path | None:
@@ -200,6 +204,26 @@ def _community_scopes(community: dict) -> str:
     return " ".join(scopes.split())
 
 
+def _pages(data: object, community: dict | None) -> dict[str, str]:
+    """One [pages.NAME] table per company page, with the organization URN it posts as."""
+    if not isinstance(data, dict):
+        raise ConfigError("pages must hold one table per page, for example [pages.acme]")
+    out: dict[str, str] = {}
+    for name, table in data.items():
+        where = f"pages.{name}"
+        if not MEASURE_NAME_RE.match(name):
+            raise ConfigError(f"{where}: '{name}' is not a plain name (letters, digits, - and _)")
+        organization = table.get("organization") if isinstance(table, dict) else None
+        if not isinstance(organization, str) or not ORGANIZATION_RE.fullmatch(organization):
+            raise ConfigError(f'{where}.organization must be the URN of the page, for example '
+                              f'"urn:li:organization:123456", not {organization!r}')
+        out[name] = organization
+    if out and community is None:
+        raise ConfigError("A page posts with the community token, and there is no [community] section. "
+                          "Add it, or remove the [pages] tables. See README, 'Post as a company page'.")
+    return out
+
+
 def _comment_delay(community: dict) -> int:
     try:
         return parse_delay(community.get("comment_delay", "0"))
@@ -251,6 +275,10 @@ def load_config(explicit: str | None = None) -> Config:
     community = data.get("community")
     if community is not None and not isinstance(community, dict):
         raise ConfigError("community must be a table, for example [community]")
+    pages = _pages(data.get("pages", {}), community)
+    scopes = _community_scopes(community or {})
+    if pages and PAGE_SCOPE not in scopes.split():
+        scopes += f" {PAGE_SCOPE}"
 
     return Config(
         root=root,
@@ -287,6 +315,7 @@ def load_config(explicit: str | None = None) -> Config:
         external_route_text=route_text,
         community_tokens_file=resolve("tokens_file", ".linkedin-community-tokens.json", community)
         if community is not None else None,
-        community_scopes=_community_scopes(community or {}),
+        community_scopes=scopes,
         comment_delay_minutes=_comment_delay(community or {}),
+        pages=pages,
     )
