@@ -20,7 +20,10 @@ def test_each_vector(name):
 
 
 def test_the_vectors_hold_the_cases_that_differ_between_editors():
-    assert {"empty line at the end", "crlf", "emoji", "e-acute nfc", "e-acute nfd", "spaces inside"} <= VECTORS.keys()
+    assert {"empty line at the end", "crlf", "emoji", "e-acute nfc", "e-acute nfd", "spaces inside",
+            "byte order mark at the start", "zero width space at the edges", "next line u+0085 at the end",
+            "file separator u+001c at the start"} <= VECTORS.keys()
+    assert VECTORS["zero width space inside"]["normalized"] == VECTORS["zero width space inside"]["text"]
     nfc, nfd = VECTORS["e-acute nfc"], VECTORS["e-acute nfd"]
     assert nfc["text"] != nfd["text"] and nfc["digest"] == nfd["digest"]
     assert VECTORS["spaces inside"]["normalized"] == VECTORS["spaces inside"]["text"]

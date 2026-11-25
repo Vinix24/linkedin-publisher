@@ -3,14 +3,16 @@
 ``parse_target`` makes no network call. It knows these forms and nothing else:
 
 - ``/feed/update/urn:li:activity:<id>/``, and the same with ``ugcPost`` or ``share``
-- ``/posts/<slug>-share-<id>-<x>/``, and the same with ``activity`` or ``ugcPost``
+- ``/posts/<slug>-share-<id>-<x>/``, and the same with ``activity`` or ``ugcPost``: one 19-digit id, at the end
 - ``?commentUrn=urn:li:comment:(activity:<post>,<comment>)``, also with ``urn:li:activity:<post>``
 - ``?dashCommentUrn=urn:li:fsd_comment:(<comment>,urn:li:activity:<post>)``
 - the bare URNs of all of these, URL-encoded or not
 
 An answer to a comment is placed on the activity of its post, so only a comment whose URN is built on an
-activity is known. A link to an answer is refused: LinkedIn has one level of answers. Any other form is an
-error. The parser never guesses. A ``lnkd.in`` link is resolved first, by ``resolve_short_link``."""
+activity is known. A link to an answer is refused: LinkedIn has one level of answers. A bare URN of an answer
+looks the same as the URN of a comment, so that one cannot be told apart: LinkedIn decides. A blank or unknown
+comment parameter and a fragment are refused. Any other form is an error. The parser never guesses. A
+``lnkd.in`` link is resolved first, over https, by ``resolve_short_link``."""
 from __future__ import annotations
 
 import re
@@ -25,7 +27,9 @@ from .api import PublisherError
 POST_URN = re.compile(r"urn:li:(activity|ugcPost|share):([0-9]+)")
 COMMENT_URN = re.compile(r"urn:li:comment:\((?:urn:li:)?activity:([0-9]+),([0-9]+)\)")
 FSD_COMMENT_URN = re.compile(r"urn:li:fsd_comment:\(([0-9]+),urn:li:activity:([0-9]+)\)")
-POSTS_SLUG = re.compile(r".+-(activity|ugcPost|share)-([0-9]+)-[A-Za-z0-9_-]+")
+POSTS_ID = re.compile(r"-(activity|ugcPost|share)-([0-9]{19})(?=-|\Z)")
+POSTS_TAIL = re.compile(r"-(?:activity|ugcPost|share)-[0-9]{19}(?:-[A-Za-z0-9_-]{1,8})?\Z")
+COMMENT_KEYS = ("commentUrn", "dashCommentUrn")
 SHORT_HOSTS = ("lnkd.in", "www.lnkd.in")
 REDIRECT_HOPS = 5
 
@@ -73,6 +77,8 @@ def parse_urn(urn: str) -> Target:
 
 
 def _comment_in_query(urn: str) -> Target:
+    if not urn.strip():
+        raise LinkError("the link has an empty comment parameter")
     target = parse_urn(urn)
     if target.kind != "comment":
         raise LinkError(f"not a comment: {urn}")
@@ -83,8 +89,12 @@ def _post_in_path(path: str) -> Target | None:
     parts = [part for part in path.split("/") if part]
     if len(parts) == 3 and parts[:2] == ["feed", "update"] and POST_URN.fullmatch(parts[2]):
         return parse_urn(parts[2])
-    if len(parts) == 2 and parts[0] == "posts" and (match := POSTS_SLUG.fullmatch(parts[1])):
-        return _post(*match.groups())
+    if len(parts) == 2 and parts[0] == "posts":
+        found = POSTS_ID.findall(parts[1])
+        if len(found) > 1:
+            raise LinkError(f"this link names more than one post: {parts[1]}")
+        if found and POSTS_TAIL.search(parts[1]):
+            return _post(*found[0])
     return None
 
 
@@ -106,11 +116,16 @@ def parse_target(value: str) -> Target:
     post = _post_in_path(urllib.parse.unquote(parts.path))
     if post is None:
         raise LinkError(f"no post in this link: {raw}. Known: /feed/update/<urn>/ and /posts/<slug>-share-<id>-<x>/")
-    query = urllib.parse.parse_qs(parts.query)
+    if parts.fragment:
+        raise LinkError(f"a link with a fragment (#{parts.fragment}) is not a known form: {raw}")
+    query = urllib.parse.parse_qs(parts.query, keep_blank_values=True)
     if {"replyUrn", "dashReplyUrn"} & query.keys():
         raise LinkError("this link points at an answer. LinkedIn has one level of answers: "
                         "use the link of the comment it answers")
-    named = {_comment_in_query(urn) for key in ("commentUrn", "dashCommentUrn") for urn in query.get(key, [])}
+    unknown = [key for key in query if key not in COMMENT_KEYS and ("comment" in key.lower() or "reply" in key.lower())]
+    if unknown:
+        raise LinkError(f"unknown comment parameter {unknown[0]!r} in this link: {raw}")
+    named = {_comment_in_query(urn) for key in COMMENT_KEYS for urn in query.get(key, [])}
     if not named:
         return post
     if len(named) > 1:
@@ -123,9 +138,10 @@ def parse_target(value: str) -> Target:
 
 def resolve_short_link(value: str, fetch: Fetch) -> str:
     """Where a lnkd.in link leads. ``fetch(url)`` makes the network call and returns the address the URL
-    redirects to, or None. Any other link comes back as it is, without a call."""
+    redirects to, or None. Any other link comes back as it is, without a call. An http link is asked over https."""
     link, hops = value.strip(), 0
     while is_short_link(link):
+        link = urllib.parse.urlsplit(link)._replace(scheme="https").geturl()
         if hops == REDIRECT_HOPS:
             raise LinkError(f"{value.strip()} still redirects after {REDIRECT_HOPS} steps")
         location = fetch(link)

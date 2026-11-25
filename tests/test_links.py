@@ -21,6 +21,7 @@ FULL = f"commentUrn=urn%3Ali%3Acomment%3A%28urn%3Ali%3Aactivity%3A{P}%2C{C}%29"
     (f"https://linkedin.com/feed/update/urn%3Ali%3Ashare%3A{P}/?utm_source=x", Target("post", f"urn:li:share:{P}", None)),
     (f"https://www.linkedin.com/posts/someone_how-to-share-files-share-{P}-AbCd/", Target("post", f"urn:li:share:{P}", None)),
     (f"https://nl.linkedin.com/posts/someone_slug-activity-{P}-x_Y-?utm_medium=member", ON_ACTIVITY),
+    (f"https://www.linkedin.com/posts/someone_my-share-2024-recap-activity-{P}/", ON_ACTIVITY),   # share-2024 is no id
     (f"{FEED}?{DASH}", COMMENT),
     (f"{FEED}?{SHORT}", COMMENT),
     (f"{FEED}?{FULL}&{DASH}&utm_source=share", COMMENT),
@@ -40,6 +41,17 @@ def test_known_forms(value, target):
     ("", "not a LinkedIn link"),
     ("https://www.linkedin.com/in/someone/", "no post in this link"),
     (f"https://www.linkedin.com/posts/someone_slug-{P}/", "no post in this link"),
+    ("https://www.linkedin.com/posts/someone_slug-share-12345-AbCd/", "no post in this link"),
+    (f"https://www.linkedin.com/posts/someone_slug-activity-{P}1-AbCd/", "no post in this link"),        # 20 digits
+    (f"https://www.linkedin.com/posts/someone_x-activity-{P}-and-many-more-words/", "no post in this link"),
+    (f"https://www.linkedin.com/posts/someone_x-share-{C}-activity-{P}-AbCd/", "more than one post"),
+    (f"{FEED}?commentUrn=", "empty comment parameter"),
+    (f"{FEED}?commentUrn=%20&{DASH}", "empty comment parameter"),
+    (f"{FEED}?{SHORT}&replyUrn=", "one level of answers"),
+    (f"{FEED}?commentId={C}", "unknown comment parameter"),
+    (f"{FEED}?{SHORT}&CommentUrn=x", "unknown comment parameter"),
+    (f"{FEED}#{SHORT}", "fragment"),
+    (f"{FEED}?{SHORT}#x", "fragment"),
     (f"https://www.linkedin.com/feed/update/urn:li:person:{P}/", "no post in this link"),
     (f"https://linkedin.com.example.org/feed/update/{ACTIVITY}/", "not a LinkedIn link"),
     (f"https://example.org/www.linkedin.com/feed/update/{ACTIVITY}/", "not a LinkedIn link"),
@@ -66,6 +78,9 @@ def test_a_short_link_is_resolved_with_the_fetcher_it_is_given():
     assert links.resolve_short_link(" https://lnkd.in/abc ", lambda url: asked.append(url) or hops.get(url)) == FEED
     assert asked == ["https://lnkd.in/abc", "https://lnkd.in/def"]
     assert links.resolve_short_link(FEED, lambda url: pytest.fail("a full link needs no call")) == FEED
+    asked.clear()
+    assert links.resolve_short_link("http://lnkd.in/abc", lambda url: asked.append(url) or hops.get(url)) == FEED
+    assert asked == ["https://lnkd.in/abc", "https://lnkd.in/def"]           # never asked over plain http
 
 
 def test_a_short_link_that_leads_nowhere_is_refused():
