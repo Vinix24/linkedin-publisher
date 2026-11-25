@@ -156,6 +156,8 @@ def cmd_status(cfg: Config, online: bool = False, fail_days: int | None = None) 
     print(token_line(cfg) or "No tokens yet. Run 'linkedin-publisher auth'.")
     if cfg.community_tokens_file is not None:
         print(token_line(cfg, "community") or f"No community tokens yet. Run '{api.auth_command('community')}'.")
+    for line in scheduled_comment_lines(cfg):
+        print(line)
     if online:
         print(f"LinkedIn accepts the token. Posting as: {api.verify_online(cfg)}")
     if fail_days is not None:
@@ -164,6 +166,18 @@ def cmd_status(cfg: Config, online: bool = False, fail_days: int | None = None) 
             print(f"FAIL: the token expires within {fail_days} days or is missing.", file=sys.stderr)
             return 2
     return 0
+
+
+def scheduled_comment_lines(cfg: Config) -> list[str]:
+    """One line per first comment that waits for its time, with the moment it is due."""
+    items = firstcomment.scheduled(cfg)
+    if not items:
+        return []
+    lines = ["Scheduled first comments (placed by the first scheduled run after the time):"]
+    for item in items:
+        when = f"{item.due:%Y-%m-%d %H:%M}" if item.due else "no readable time, will be marked failed"
+        lines.append(f"  {item.path.name}  due {when}")
+    return lines
 
 
 def cmd_due(cfg: Config, now: dt.datetime) -> None:
@@ -182,6 +196,9 @@ def cmd_due(cfg: Config, now: dt.datetime) -> None:
         print("\nSkipped:")
         for post in skipped:
             print(f"  {post.path.name}: {post.reason}")
+    comment_lines = scheduled_comment_lines(cfg)
+    if comment_lines:
+        print("\n" + "\n".join(comment_lines))
     line = token_line(cfg)
     if line:
         print(f"\n{line}")
@@ -489,6 +506,9 @@ def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None, ret
     if scheduled:
         write_heartbeat(cfg, now)
         warn_token_once_a_day(cfg, now, log)
+    if scheduled and mode == "post":
+        # Before the post step: a comment that is due is placed even when nothing else is due or the post fails.
+        firstcomment.sweep(cfg, now, log, alert)
 
     if only is not None:
         if mode == "notify":
@@ -629,7 +649,7 @@ def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None, ret
             log(f"Posted: {post.path.name} -> {url}")
             log(f"Moved to {target}")
         # The comment is a separate act: whatever happens to it, the post stays placed.
-        firstcomment.place(cfg, post, urn, target or post.path, log, alert)
+        firstcomment.after_post(cfg, post, urn, target, now, log, alert)
         if target is None:
             return 1
         alert(cfg, "LinkedIn post is live", f"{post.path.stem}. The first hour counts, answer comments.")
@@ -748,11 +768,31 @@ def cmd_precheck(cfg: Config, now: dt.datetime, days_ahead: int, as_json: bool =
             alert(cfg, "LinkedIn queue unreadable", "A scheduled run could not see the queue. See the log.")
             raise
         alert_precheck_problems(cfg, now, reports)
+        comments = precheck.scheduled_comment_problems(cfg, now, days_ahead)
+        alert_comment_problems(cfg, now, comments)
     if as_json:
-        print(json.dumps(precheck_json(reports, days_ahead), indent=2))
+        out = precheck_json(reports, days_ahead)
+        if comments:     # the shape of a precheck without scheduled comments does not change
+            out["scheduled_comments"] = [{"post": item.path.name, "due": item.due.isoformat(), "problem": problem}
+                                         for item, problem in comments]
+        print(json.dumps(out, indent=2))
     else:
         print_precheck(reports, now, days_ahead)
-    return 3 if any(report.problems for report in reports) else 0
+        for item, problem in comments:
+            print(f"scheduled first comment {item.path.name}, due {item.due:%Y-%m-%d %H:%M}: {problem}")
+    return 3 if comments or any(report.problems for report in reports) else 0
+
+
+def alert_comment_problems(cfg: Config, now: dt.datetime, comments: list) -> None:
+    """The same once-per-day rule as for posts, for a scheduled comment whose token will not do at its time."""
+    noted = queue.load_notes(cfg, "precheck")
+    for item, problem in comments:
+        ref = f"comment:{now.date().isoformat()}"
+        if (item.key, ref) in noted:
+            continue
+        queue.write_receipt(cfg, "precheck", key=item.key, file_name=item.path.name, ref=ref, error=problem)
+        alert(cfg, "LinkedIn precheck: a first comment will not be placed",
+              f"{item.path.stem} (due {item.due:%Y-%m-%d %H:%M}): {problem}")
 
 
 def alert_precheck_problems(cfg: Config, now: dt.datetime, reports: list) -> None:

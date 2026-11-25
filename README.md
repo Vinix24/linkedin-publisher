@@ -159,6 +159,41 @@ text in a file with the post's name and the ending `.comment.md`, next to it: `e
   shows the comment was placed.
 - Without a valid community token the post still goes out. `precheck` reports it in advance.
 
+### Delay the first comment
+
+A comment placed in the same second as the post looks staged. Set a delay and the publisher waits:
+
+```markdown
+---
+status: queued
+slot: 2026-10-01
+comment_delay: 30m
+---
+```
+
+- Values are `0`, or a whole number of minutes or hours: `30m`, `90m`, `1h`, `2h`. Anything else is
+  refused as a content problem. `0` places the comment right after the post, as without a delay.
+- A default for every post goes in the configuration: `[community]` `comment_delay = "1h"`. The
+  field in a post wins over it, so `comment_delay: 0` turns the default off for that post.
+- The delay is part of the approval, but only when the post has a comment and the delay is not
+  zero. Changing the delay, or the config default a post relies on, voids the approval. Posts
+  approved without a delay keep their key.
+- When the post is placed, the published file gets `comment_status: scheduled` and `comment_due`
+  (an absolute local time), and a `comment-scheduled` receipt is written. No comment is sent yet.
+- Every scheduled `publish --post` run places the comments that are due, before it looks at the
+  queue, so a due comment does not wait for a post. There is no long-running process: with a
+  launchd `StartInterval` of 900 the comment goes out at the first run after its time, up to 15
+  minutes late.
+- Two runs cannot place the same comment: the comment takes an atomic claim of its own
+  (`comment-<content key>`) before the first call to LinkedIn. It stays after a placed or unclear
+  comment and is removed after a failure where nothing was sent. An unclear comment is never sent
+  again by itself.
+- A comment that is due while the community token is missing or expired is recorded as
+  `comment_status: failed` with the reason and a notification. Fix the token, then
+  `publish --comment-retry --file <published post>`.
+- `due` and `status` list the scheduled comments and when they are due. `precheck` reports a
+  scheduled comment whose community token will not be valid at its due time.
+
 ## Write a post
 
 ```markdown

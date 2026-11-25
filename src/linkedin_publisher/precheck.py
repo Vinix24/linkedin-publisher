@@ -10,7 +10,7 @@ import datetime as dt
 import shlex
 from dataclasses import dataclass, field
 
-from . import api, approval, checks, claims
+from . import api, approval, checks, claims, firstcomment
 from . import postqueue as queue
 from .config import Config
 
@@ -68,6 +68,21 @@ def evaluate(cfg: Config, now: dt.datetime, days_ahead: int) -> list[PostReport]
     return reports
 
 
+def scheduled_comment_problems(cfg: Config, now: dt.datetime, days_ahead: int) -> list[tuple[firstcomment.Scheduled, str]]:
+    """Scheduled comments due up to the end of the day ``days_ahead`` from today whose community token
+    will not do at their due time. A comment already due is judged by the token as it is now."""
+    last = now.date() + dt.timedelta(days=days_ahead)
+    found = []
+    for item in firstcomment.scheduled(cfg):
+        if item.due is None or item.due.date() > last:
+            continue
+        local = max(item.due.astimezone().replace(tzinfo=None), now)
+        reason = api.community_problem(cfg, local)
+        if reason:
+            found.append((item, f"the comment would not be placed: {reason}"))
+    return found
+
+
 def problems_of(cfg: Config, post: queue.Post, slot: dt.datetime, key: str, state: str | None) -> list[Problem]:
     problems = []
     path = shlex.quote(str(post.path))
@@ -99,7 +114,8 @@ def problems_of(cfg: Config, post: queue.Post, slot: dt.datetime, key: str, stat
                        f"linkedin-publisher publish --post --file {path} --retry", "blocked"))
 
     if post.comment:
-        reason = api.community_problem(cfg, dt.datetime.now())
+        delay = approval.effective_delay(post, cfg)      # the token must still do when the comment is due
+        reason = api.community_problem(cfg, slot + dt.timedelta(minutes=delay) if delay else dt.datetime.now())
         if reason:
             problems.append(Problem("comment", f"the post has a first comment, but {reason}. The post "
                                                "would go out without its comment", "comment"))
