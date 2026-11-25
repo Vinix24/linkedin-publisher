@@ -14,6 +14,7 @@ from linkedin_publisher import postqueue as queue
 
 CREDS = {"LINKEDIN_CLIENT_ID": "x", "LINKEDIN_CLIENT_SECRET": "y"}
 TOKENS = {"access_token": "t", "author_urn": "urn:li:person:x"}
+pytestmark = pytest.mark.usefixtures("allow_linkedin_send_under_test")   # real publish, local stand-in
 
 
 def serve(status: int, headers: dict | None = None, body: bytes = b""):

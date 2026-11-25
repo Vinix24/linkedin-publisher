@@ -57,6 +57,14 @@ class PublishUncertain(PublisherError):
     text twice, so the tool never does."""
 
 
+def refuse_in_a_test_run() -> None:
+    """A test run never posts or comments: pytest sets PYTEST_CURRENT_TEST while a test runs. A test
+    of a related script once posted for real, because only one function of the network was faked."""
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        raise PublisherError("Refusing to send to LinkedIn from a test run (PYTEST_CURRENT_TEST is set). "
+                             "Nothing was sent.")
+
+
 # ------------------------------------------------------------------ credentials
 
 def load_credentials(cfg: Config, app: str = "main") -> dict[str, str]:
@@ -434,6 +442,7 @@ def publish(cfg: Config, creds: dict[str, str], tokens: dict[str, Any], commenta
         raise PreflightRejected(
             f"unescaped reserved character ({', '.join(sorted(set(leftover)))}), not sent")
 
+    refuse_in_a_test_run()
     session = requests.Session()
     session.headers.update({
         "Authorization": f"Bearer {tokens['access_token']}",
@@ -540,6 +549,7 @@ def place_comment(cfg: Config, creds: dict[str, str], tokens: dict[str, Any], po
 
     Every answer that is neither a success nor a clear refusal raises PublishUncertain: the
     comment may be there, and the caller never sends it a second time by itself."""
+    refuse_in_a_test_run()
     try:
         resp = requests.post(url or comments_url(post_urn), headers={
             "Authorization": f"Bearer {tokens['access_token']}",

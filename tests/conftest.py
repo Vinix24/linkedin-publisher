@@ -8,9 +8,10 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import pytest
+from requests.adapters import HTTPAdapter
 
-from linkedin_publisher import cli
-from linkedin_publisher.config import load_config
+from linkedin_publisher import api, cli
+from linkedin_publisher.config import CONFIG_ENV, load_config
 
 CONFIG = """\
 [paths]
@@ -52,6 +53,41 @@ def no_desktop_notifications(monkeypatch):
     """A test run must not pop up real notifications. A test that wants to see
     them either replaces cli.notify itself or configures a [notify] command."""
     monkeypatch.setattr(cli, "notify", lambda title, message: None)
+
+
+LOOPBACK = ("127.0.0.1", "localhost", "::1")
+
+
+@pytest.fixture(autouse=True)
+def no_request_leaves_this_machine(monkeypatch):
+    """Every request through requests to a host other than this machine fails before a connection
+    is made. The stand-ins for LinkedIn and for websites in these tests all run on 127.0.0.1."""
+    real_send = HTTPAdapter.send
+
+    def loopback_only(adapter, request, *args, **kwargs):
+        host = urlparse(request.url).hostname
+        if host not in LOOPBACK:
+            raise AssertionError(f"a test tried to reach {host}: only this machine is allowed")
+        return real_send(adapter, request, *args, **kwargs)
+
+    monkeypatch.setattr(HTTPAdapter, "send", loopback_only)
+
+
+@pytest.fixture(autouse=True)
+def no_real_setup(monkeypatch, tmp_path_factory):
+    """No test reads a real config, .env or token file. Without --config the tool reads
+    $LINKEDIN_PUBLISHER_CONFIG and then ./publisher.toml, and credentials in the environment win
+    over the .env file, so those are cleared and every test runs in an empty folder."""
+    for name in (CONFIG_ENV, "LINKEDIN_API_VERSION", *(k for keys in api.CREDENTIAL_KEYS.values() for k in keys)):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.chdir(tmp_path_factory.mktemp("cwd"))
+
+
+@pytest.fixture
+def allow_linkedin_send_under_test(monkeypatch):
+    """For a test that runs the real api.publish or api.place_comment against a local stand-in:
+    lifts their refusal to send from a test run. The block on other hosts stays on."""
+    monkeypatch.setattr(api, "refuse_in_a_test_run", lambda: None)
 
 
 HOOK_SCRIPT = """\
