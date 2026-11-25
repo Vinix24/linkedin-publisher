@@ -25,3 +25,13 @@ def test_publish_refuses_in_a_test_run_before_it_reads_a_token(cfg):
 def test_place_comment_refuses_in_a_test_run_before_it_reads_a_token(cfg):
     with pytest.raises(api.PublisherError, match="from a test run"):
         api.place_comment(cfg, {}, {}, "urn:li:share:1", "Hi")
+
+
+def test_place_reply_refuses_in_a_test_run_before_it_reads_a_token(cfg):
+    with pytest.raises(api.PublisherError, match="from a test run"):
+        api.place_reply(cfg, {}, {}, "urn:li:activity:1", "urn:li:comment:(urn:li:activity:1,2)", "Hi")
+
+
+def test_read_comments_refuses_in_a_test_run_before_it_reads_a_token(cfg):
+    with pytest.raises(api.PublisherError, match="from a test run"):
+        api.read_comments(cfg, {}, {}, "urn:li:activity:1")
