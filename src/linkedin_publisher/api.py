@@ -531,10 +531,20 @@ def has_page_scope(tokens: dict[str, Any]) -> bool:
 
 
 def page_problem(cfg: Config, now: dt.datetime | None = None) -> str | None:
-    """Why the community token cannot post as a page at ``now``, or None when it can."""
-    problem = community_problem(cfg, now)
-    if problem or has_page_scope(read_tokens(cfg, "community")):
-        return problem
+    """Why the community token cannot post as a page at ``now``, or None when it can.
+
+    It follows the send path (``ensure_access_token``): an access token with more than a day left is used as
+    it is, so a refresh token that expired next to it does not hold the post yet. With a day or less left,
+    ``community_problem`` judges the token, as for a comment. A scheduled run asks this before it chooses its
+    post, so a token that cannot be checked at all is a problem here and never an exception: it holds the
+    page posts, and a post as the member still goes out."""
+    try:
+        days = token_days_left(cfg, now, "community")
+        problem = None if days is not None and days > 1 else community_problem(cfg, now)
+        if problem or has_page_scope(read_tokens(cfg, "community")):
+            return problem
+    except Exception as exc:        # a hand-edited time with a zone, a file gone between two reads, ...
+        return f"the community token cannot be checked ({exc}). Run: {auth_command('community')}"
     return f"the community token was not granted {PAGE_SCOPE}. Run: {auth_command('community')}"
 
 

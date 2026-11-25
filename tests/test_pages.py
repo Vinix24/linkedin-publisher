@@ -18,6 +18,7 @@ PAGE_TOKENS = {"access_token": "c", "author_urn": "urn:li:person:c", "access_exp
                "scope": "r_basicprofile w_member_social w_organization_social"}
 EVENING_BEFORE = dt.datetime(2026, 9, 22, 17, 0)
 SLOT_PLUS_5 = WEDNESDAY_10 + dt.timedelta(minutes=5)
+REAL_ENSURE_ACCESS_TOKEN = api.ensure_access_token      # taken before a fixture replaces it
 
 
 def load(tmp_path, toml):
@@ -112,6 +113,40 @@ def test_a_page_post_the_token_cannot_send_does_not_hold_up_a_member_post(pages)
     assert pages.receipt_stages() == ["page-problem", "attempt", "placed"]   # the page post: one note, never tried
     assert pages.titles() == [cli.PAGE_HELD_TITLE, "LinkedIn post is live"]
     assert not claims.exists(pages.cfg, queue.post_key(queue.read_post(page), pages.cfg))
+
+
+def test_a_token_that_cannot_be_checked_holds_the_page_post_and_not_the_member_post(pages):
+    """A hand-edited token file with a time zone: comparing it with a naive time raises TypeError."""
+    pages.cfg.community_tokens_file.write_text(json.dumps({**PAGE_TOKENS, "access_expires_at": "2999-01-01T00:00:00+00:00"}))
+    pages.post("a.md", {"author": "acme"}, body="Page text.")
+    pages.post("b.md", body="Member text.")
+    assert cli.cmd_publish(pages.cfg, SLOT_PLUS_5, "post", None) == 3
+    assert [s["author"] for s in pages.sends] == [None]
+    assert pages.receipt_stages() == ["page-problem", "attempt", "placed"]
+    assert "the community token cannot be checked" in api.page_problem(pages.cfg, SLOT_PLUS_5)
+
+
+@pytest.mark.parametrize("access, problem", [
+    ("2999-01-01T00:00:00", None),                                          # used as it is, no refresh needed
+    ("2026-09-23T22:00:00", "the community refresh token has expired"),     # 12 hours left at the slot
+])
+def test_an_expired_refresh_token_holds_a_page_post_only_when_the_access_token_needs_it(pages, capsys, access, problem):
+    pages.cfg.community_tokens_file.write_text(json.dumps({**PAGE_TOKENS, "access_expires_at": access,
+                                                           "refresh_token": "r", "refresh_expires_at": "2020-01-01T00:00:00"}))
+    pages.post(meta={"author": "acme"})
+    assert cli.cmd_precheck(pages.cfg, EVENING_BEFORE, 1, as_json=True) == (3 if problem else 0)
+    found = json.loads(capsys.readouterr().out)["posts"][0]["problems"]
+    assert [p["kind"] for p in found] == (["page"] if problem else []) and all(problem in p["message"] for p in found)
+
+
+def test_a_live_access_token_sends_the_page_post_although_its_refresh_token_expired(pages, monkeypatch):
+    """The real ensure_access_token does not refresh a token with more than a day left, so the post can go."""
+    monkeypatch.setattr(api, "ensure_access_token", REAL_ENSURE_ACCESS_TOKEN)
+    pages.cfg.community_tokens_file.write_text(json.dumps({**PAGE_TOKENS, "refresh_token": "r",
+                                                           "refresh_expires_at": "2020-01-01T00:00:00"}))
+    pages.post(meta={"author": "acme"})
+    assert cli.cmd_publish(pages.cfg, SLOT_PLUS_5, "post", None) == 0
+    assert [s["author"] for s in pages.sends] == [ORG] and cli.PAGE_HELD_TITLE not in pages.titles()
 
 
 def test_an_unknown_page_is_reported_by_precheck_and_never_sent(pages, capsys):

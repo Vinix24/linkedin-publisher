@@ -669,7 +669,8 @@ The JSON has a fixed shape:
 
 `kind` is one of `approval-missing`, `approval-mismatch`, `measure-line`, `media`, `content`,
 `expired`, `blocked`, `comment`, `page`, `check-failed`. `page` means a page post that the community
-token cannot send: no token, an expired one, or one without `w_organization_social`.
+token cannot send: no token, an expired one, one that cannot be read, or one without
+`w_organization_social`.
 
 **Posts that run somewhere else.** While you move posts over from another way of posting, some
 posts do not run through this tool's schedule and have no approval in the file. Name the field and
