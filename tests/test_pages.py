@@ -223,7 +223,7 @@ def reply(status, body=None, headers=None):
 
 @pytest.mark.parametrize("kind", ["image", "video", "document"])
 @pytest.mark.parametrize("author, owner", [(ORG, ORG), (None, TOKENS["author_urn"])])
-def test_a_page_post_owns_its_media(cfg, tmp_path, monkeypatch, kind, author, owner):
+def test_a_page_post_owns_its_media(cfg, tmp_path, monkeypatch, kind, author, owner, allow_linkedin_send_under_test):
     calls = []
     value = {"uploadUrl": "https://upload.test/1", "image": "urn:li:image:1", "video": "urn:li:video:1",
              "document": "urn:li:document:1", "uploadInstructions": [{"uploadUrl": "https://upload.test/1",
