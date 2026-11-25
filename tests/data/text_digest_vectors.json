@@ -1,6 +1,6 @@
 {
   "about": "Test vectors for text_digest in linkedin-publisher. Copy this file as it is.",
-  "normalize": "Unicode NFC; \\r\\n and \\r become \\n; Python str.strip() at both ends; nothing inside changes.",
+  "normalize": "Unicode NFC; \\r\\n and \\r become \\n; at both ends Python str.strip() and U+FEFF and U+200B, until nothing changes; nothing inside changes.",
   "digest": "sha256 as lowercase hex over the UTF-8 bytes of the normalized text.",
   "vectors": [
     {"name": "plain", "text": "Dank voor je reactie.", "normalized": "Dank voor je reactie.", "digest": "465868f4e9e84a4055a39a31d5b81c0a55906ba84f62f1059d259f99e6f4eaa1"},
@@ -14,6 +14,11 @@
     {"name": "blank lines inside", "text": "Alinea een.\n\n\nAlinea twee.", "normalized": "Alinea een.\n\n\nAlinea twee.", "digest": "2e0b6724a5a330135e8dbdf0cab2015ea773103119baa0b2983690e09f559d81"},
     {"name": "spaces at start and end", "text": "  \t Dank voor je reactie. \n ", "normalized": "Dank voor je reactie.", "digest": "465868f4e9e84a4055a39a31d5b81c0a55906ba84f62f1059d259f99e6f4eaa1"},
     {"name": "no-break space at the end", "text": "Dank voor je reactie.\u00a0", "normalized": "Dank voor je reactie.", "digest": "465868f4e9e84a4055a39a31d5b81c0a55906ba84f62f1059d259f99e6f4eaa1"},
+    {"name": "byte order mark at the start", "text": "\ufeffDank voor je reactie.", "normalized": "Dank voor je reactie.", "digest": "465868f4e9e84a4055a39a31d5b81c0a55906ba84f62f1059d259f99e6f4eaa1"},
+    {"name": "zero width space at the edges", "text": "\u200b Dank voor je reactie. \u200b\n", "normalized": "Dank voor je reactie.", "digest": "465868f4e9e84a4055a39a31d5b81c0a55906ba84f62f1059d259f99e6f4eaa1"},
+    {"name": "zero width space inside", "text": "Dank\u200bje.", "normalized": "Dank\u200bje.", "digest": "3e66baf7cf5a615564319d42cf81fb22b41e87816dc1b8837e72eb0573ad5221"},
+    {"name": "next line u+0085 at the end", "text": "Dank voor je reactie.\u0085", "normalized": "Dank voor je reactie.", "digest": "465868f4e9e84a4055a39a31d5b81c0a55906ba84f62f1059d259f99e6f4eaa1"},
+    {"name": "file separator u+001c at the start", "text": "\u001cDank voor je reactie.", "normalized": "Dank voor je reactie.", "digest": "465868f4e9e84a4055a39a31d5b81c0a55906ba84f62f1059d259f99e6f4eaa1"},
     {"name": "white space only", "text": " \r\n\t ", "normalized": "", "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}
   ]
 }
