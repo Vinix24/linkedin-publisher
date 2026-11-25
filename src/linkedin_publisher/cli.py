@@ -92,15 +92,17 @@ def last_check_line(cfg: Config, now: dt.datetime | None = None) -> str:
     return f"Last check: {last:%Y-%m-%d %H:%M} ({minutes} min ago){warning}"
 
 
-def token_line(cfg: Config) -> str | None:
-    days = api.token_days_left(cfg)
+def token_line(cfg: Config, app: str = "main") -> str | None:
+    days = api.token_days_left(cfg, app=app)
     if days is None:
         return None
+    label = "Access token" if app == "main" else "Community access token"
+    command = api.auth_command(app)
     if days <= 0:
-        return "Access token has EXPIRED. Run 'linkedin-publisher auth'."
+        return f"{label} has EXPIRED. Run '{command}'."
     if days <= TOKEN_WARN_DAYS:
-        return f"Access token expires in {days:.0f} days. Run 'linkedin-publisher auth' soon."
-    return f"Access token valid for {days:.0f} more days."
+        return f"{label} expires in {days:.0f} days. Run '{command}' soon."
+    return f"{label} valid for {days:.0f} more days."
 
 
 # ----------------------------------------------------------------------- commands
@@ -152,6 +154,8 @@ def cmd_status(cfg: Config, online: bool = False, fail_days: int | None = None) 
     print(f"receipts:  {cfg.receipts_dir} ({len(queue.load_placed_keys(cfg))} placed)")
     print(f"env file:  {cfg.env_file} ({'present' if cfg.env_file.exists() else 'MISSING'})")
     print(token_line(cfg) or "No tokens yet. Run 'linkedin-publisher auth'.")
+    if cfg.community_tokens_file is not None:
+        print(token_line(cfg, "community") or f"No community tokens yet. Run '{api.auth_command('community')}'.")
     if online:
         print(f"LinkedIn accepts the token. Posting as: {api.verify_online(cfg)}")
     if fail_days is not None:
@@ -809,8 +813,11 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--github", action="store_true",
                       help="also add GitHub Actions workflows, so posting works with your computer off")
     init.add_argument("--timezone", help="IANA timezone for the workflows (default: this computer's)")
-    sub.add_parser("auth", help="sign in with LinkedIn and store tokens")
-    sub.add_parser("refresh", help="refresh the access token if a refresh token exists")
+    auth = sub.add_parser("auth", help="sign in with LinkedIn and store tokens")
+    refresh = sub.add_parser("refresh", help="refresh the access token if a refresh token exists")
+    for parser_with_app in (auth, refresh):
+        parser_with_app.add_argument("--app", choices=api.APPS, default="main",
+                                     help="main (default) or the optional community app")
     status = sub.add_parser("status", help="show paths, queue size and token lifetime")
     status.add_argument("--online", action="store_true",
                         help="also ask LinkedIn whether the token works (read-only, posts nothing)")
@@ -856,9 +863,10 @@ def main(argv: list[str] | None = None) -> int:
         cfg = load_config(args.config)
         now = dt.datetime.now()
         if command == "auth":
-            api.authorize(cfg, make_log(cfg))
+            api.authorize(cfg, make_log(cfg), args.app)
         elif command == "refresh":
-            api.ensure_access_token(cfg, api.load_credentials(cfg), api.read_tokens(cfg), make_log(cfg))
+            api.ensure_access_token(cfg, api.load_credentials(cfg, args.app),
+                                    api.read_tokens(cfg, args.app), make_log(cfg), args.app)
         elif command == "status":
             return cmd_status(cfg, args.online, args.fail_days)
         elif command == "schedule":

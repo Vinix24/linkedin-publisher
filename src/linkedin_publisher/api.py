@@ -20,6 +20,7 @@ from .config import Config
 AUTH_URL = "https://www.linkedin.com/oauth/v2/authorization"
 TOKEN_URL = "https://www.linkedin.com/oauth/v2/accessToken"
 USERINFO_URL = "https://api.linkedin.com/v2/userinfo"
+ME_URL = "https://api.linkedin.com/v2/me"
 POSTS_URL = "https://api.linkedin.com/rest/posts"
 IMAGES_URL = "https://api.linkedin.com/rest/images"
 VIDEOS_URL = "https://api.linkedin.com/rest/videos"
@@ -29,6 +30,12 @@ DOCUMENTS_URL = "https://api.linkedin.com/rest/documents"
 DOCUMENT_READY_SECONDS = 10 * 60
 DOCUMENT_POLL_SECONDS = 5
 SCOPES = "openid profile w_member_social"
+
+APPS = ("main", "community")
+# The main keys are never read for the community app, so a LINKEDIN_CLIENT_ID in the environment
+# cannot send its login to the wrong app.
+CREDENTIAL_KEYS = {"main": ("LINKEDIN_CLIENT_ID", "LINKEDIN_CLIENT_SECRET"),
+                   "community": ("LINKEDIN_COMMUNITY_CLIENT_ID", "LINKEDIN_COMMUNITY_CLIENT_SECRET")}
 
 Log = Callable[[str], None]
 
@@ -51,7 +58,7 @@ class PublishUncertain(PublisherError):
 
 # ------------------------------------------------------------------ credentials
 
-def load_credentials(cfg: Config) -> dict[str, str]:
+def load_credentials(cfg: Config, app: str = "main") -> dict[str, str]:
     """Read the .env file; real environment variables win over it."""
     creds: dict[str, str] = {}
     if cfg.env_file.exists():
@@ -61,52 +68,110 @@ def load_credentials(cfg: Config) -> dict[str, str]:
                 continue
             key, _, value = line.partition("=")
             creds[key.strip()] = value.strip().strip('"').strip("'")
-    for key in ("LINKEDIN_CLIENT_ID", "LINKEDIN_CLIENT_SECRET", "LINKEDIN_API_VERSION"):
+    keys = CREDENTIAL_KEYS[app]
+    for key in (*keys, "LINKEDIN_API_VERSION"):
         if os.environ.get(key):
             creds[key] = os.environ[key]
-    for required in ("LINKEDIN_CLIENT_ID", "LINKEDIN_CLIENT_SECRET"):
+    for required in keys:
         if not creds.get(required):
             raise PublisherError(f"{required} is missing. Put it in {cfg.env_file} "
                                  "or in the environment. See README, 'Set up LinkedIn'.")
     return creds
 
 
+def client_pair(creds: dict[str, str], app: str) -> tuple[str, str]:
+    """The client id and secret of an app, taken from the keys that belong to it."""
+    client_id, client_secret = CREDENTIAL_KEYS[app]
+    return creds[client_id], creds[client_secret]
+
+
+def auth_command(app: str) -> str:
+    return "linkedin-publisher auth" + (" --app community" if app == "community" else "")
+
+
+def tokens_path(cfg: Config, app: str = "main") -> Path:
+    if app == "main":
+        return cfg.tokens_file
+    if cfg.community_tokens_file is None:
+        raise PublisherError("The community app is not configured. Add a [community] section "
+                             "to the config file. See README, 'Community Management API'.")
+    return cfg.community_tokens_file
+
+
 def api_version(cfg: Config, creds: dict[str, str]) -> str:
     return creds.get("LINKEDIN_API_VERSION") or cfg.api_version
 
 
-def read_tokens(cfg: Config) -> dict[str, Any]:
-    if not cfg.tokens_file.exists():
-        raise PublisherError("No tokens yet. Run: linkedin-publisher auth")
-    return json.loads(cfg.tokens_file.read_text(encoding="utf-8"))
+def read_tokens(cfg: Config, app: str = "main") -> dict[str, Any]:
+    path = tokens_path(cfg, app)
+    if not path.exists():
+        raise PublisherError(f"No tokens yet. Run: {auth_command(app)}")
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
-def write_tokens(cfg: Config, data: dict[str, Any]) -> None:
-    cfg.tokens_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    cfg.tokens_file.chmod(0o600)
+def write_tokens(cfg: Config, data: dict[str, Any], app: str = "main") -> None:
+    path = tokens_path(cfg, app)
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    path.chmod(0o600)
 
 
-def token_days_left(cfg: Config, now: dt.datetime | None = None) -> float | None:
+def token_days_left(cfg: Config, now: dt.datetime | None = None, app: str = "main") -> float | None:
     """Days until the access token expires, or None when there is no token."""
-    if not cfg.tokens_file.exists():
+    path = tokens_path(cfg, app)
+    if not path.exists():
         return None
-    expires = json.loads(cfg.tokens_file.read_text(encoding="utf-8")).get("access_expires_at")
+    expires = json.loads(path.read_text(encoding="utf-8")).get("access_expires_at")
     if not expires:
         return None
     now = now or dt.datetime.now()
     return (dt.datetime.fromisoformat(expires) - now).total_seconds() / 86400
 
 
+def parse_me(body: dict[str, Any]) -> str:
+    member_id = body.get("id") if isinstance(body, dict) else None
+    if not isinstance(member_id, str) or not member_id:
+        raise PublisherError("No member id in the /v2/me response.")
+    return f"urn:li:person:{member_id}"
+
+
+def _name(*parts: Any) -> str:
+    return " ".join(" ".join(str(p) for p in parts if p).split())
+
+
+def check_same_account(cfg: Config, community_name: str, log: Log) -> None:
+    """Compare the two logins by display name. Person ids differ per LinkedIn app, so the
+    community URN never equals the main one, even for the same member."""
+    main_token = (json.loads(cfg.tokens_file.read_text(encoding="utf-8")).get("access_token")
+                  if cfg.tokens_file.exists() and community_name else None)
+    try:
+        who = requests.get(USERINFO_URL, headers={"Authorization": f"Bearer {main_token}"},
+                           timeout=30) if main_token else None
+    except requests.RequestException:
+        who = None
+    if who is None or who.status_code != 200:
+        log("The account could not be cross-checked against the main token.")
+        return
+    body = who.json()
+    main_name = _name(body.get("name")) or _name(body.get("given_name"), body.get("family_name"))
+    if main_name.casefold() != community_name.casefold():
+        raise PublisherError(f"The browser was signed in to a different LinkedIn account: "
+                             f"{community_name!r}, but the main token is for {main_name!r}. "
+                             "The community token was not saved.")
+
+
 # -------------------------------------------------------------------------- auth
 
-def authorize(cfg: Config, log: Log = print) -> str:
-    """Browser login. Returns the author URN and writes the token file."""
-    creds = load_credentials(cfg)
+def authorize(cfg: Config, log: Log = print, app: str = "main") -> str:
+    """Browser login. Returns the author URN and writes the token file of the chosen app."""
+    creds = load_credentials(cfg, app)
+    client_id, client_secret = client_pair(creds, app)
+    scopes = SCOPES if app == "main" else cfg.community_scopes
+    tokens_path(cfg, app)
     redirect_uri = f"http://localhost:{cfg.redirect_port}/callback"
     state = secrets.token_urlsafe(16)
     url = f"{AUTH_URL}?" + urllib.parse.urlencode({
-        "response_type": "code", "client_id": creds["LINKEDIN_CLIENT_ID"],
-        "redirect_uri": redirect_uri, "state": state, "scope": SCOPES,
+        "response_type": "code", "client_id": client_id,
+        "redirect_uri": redirect_uri, "state": state, "scope": scopes,
     })
 
     result: dict[str, str] = {}
@@ -150,23 +215,32 @@ def authorize(cfg: Config, log: Log = print) -> str:
     resp = requests.post(TOKEN_URL, data={
         "grant_type": "authorization_code", "code": result["code"],
         "redirect_uri": redirect_uri,
-        "client_id": creds["LINKEDIN_CLIENT_ID"], "client_secret": creds["LINKEDIN_CLIENT_SECRET"],
+        "client_id": client_id, "client_secret": client_secret,
     }, timeout=30)
     if resp.status_code != 200:
         raise PublisherError(f"Token exchange failed ({resp.status_code}): {resp.text}")
     payload = resp.json()
 
-    who = requests.get(USERINFO_URL, headers={"Authorization": f"Bearer {payload['access_token']}"},
-                       timeout=30)
+    community = app == "community"
+    who = requests.get(ME_URL if community else USERINFO_URL,
+                       headers={"Authorization": f"Bearer {payload['access_token']}"}, timeout=30)
     if who.status_code != 200:
-        raise PublisherError(f"userinfo failed ({who.status_code}): {who.text}. "
-                             "Is 'Sign In with LinkedIn using OpenID Connect' added to your app?")
-    member_id = who.json().get("sub")
-    if not member_id:
-        raise PublisherError("No member id in the userinfo response.")
+        raise PublisherError(f"{'/v2/me' if community else 'userinfo'} failed ({who.status_code}): "
+                             f"{who.text}. " + ("Does the community app have the r_basicprofile scope?"
+                             if community else "Is 'Sign In with LinkedIn using OpenID Connect' added to your app?"))
+    if community:
+        me = who.json()
+        author = parse_me(me)
+        name = _name(me.get("localizedFirstName"), me.get("localizedLastName"))
+        check_same_account(cfg, name, log)
+        log(f"Signed in as: {name or author}")
+    else:
+        member_id = who.json().get("sub")
+        if not member_id:
+            raise PublisherError("No member id in the userinfo response.")
+        author = f"urn:li:person:{member_id}"
 
     now = dt.datetime.now()
-    author = f"urn:li:person:{member_id}"
     write_tokens(cfg, {
         "access_token": payload["access_token"],
         "access_expires_at": (now + dt.timedelta(seconds=payload.get("expires_in", 0))).isoformat(),
@@ -175,17 +249,17 @@ def authorize(cfg: Config, log: Log = print) -> str:
         if payload.get("refresh_token_expires_in") else "",
         "author_urn": author,
         "obtained_at": now.isoformat(),
-    })
-    log(f"Tokens saved to {cfg.tokens_file}. Author: {author}")
+    }, app)
+    log(f"Tokens saved to {tokens_path(cfg, app)}. Author: {author}")
     if not payload.get("refresh_token"):
         days = payload.get("expires_in", 0) // 86400
         log(f"No refresh token was issued. The access token lasts about {days} days. "
-            "After that, run 'linkedin-publisher auth' again.")
+            f"After that, run '{auth_command(app)}' again.")
     return author
 
 
 def ensure_access_token(cfg: Config, creds: dict[str, str], tokens: dict[str, Any],
-                        log: Log = print) -> dict[str, Any]:
+                        log: Log = print, app: str = "main") -> dict[str, Any]:
     """Refresh the access token when it expires within a day and a refresh token exists."""
     expires = tokens.get("access_expires_at")
     if expires:
@@ -196,20 +270,22 @@ def ensure_access_token(cfg: Config, creds: dict[str, str], tokens: dict[str, An
             pass
     if not tokens.get("refresh_token"):
         raise PublisherError("The access token has expired or expires within a day, and there is "
-                             "no refresh token. Run 'linkedin-publisher auth' again.")
+                             f"no refresh token. Run '{auth_command(app)}' again.")
+    client_id, client_secret = client_pair(creds, app)
     resp = requests.post(TOKEN_URL, data={
         "grant_type": "refresh_token", "refresh_token": tokens["refresh_token"],
-        "client_id": creds["LINKEDIN_CLIENT_ID"], "client_secret": creds["LINKEDIN_CLIENT_SECRET"],
+        "client_id": client_id, "client_secret": client_secret,
     }, timeout=30)
     if resp.status_code != 200:
-        raise PublisherError(f"Refresh failed ({resp.status_code}): {resp.text}. Run 'auth' again.")
+        raise PublisherError(f"Refresh failed ({resp.status_code}): {resp.text}. "
+                             f"Run '{auth_command(app)}' again.")
     payload = resp.json()
     tokens["access_token"] = payload["access_token"]
     tokens["access_expires_at"] = (
         dt.datetime.now() + dt.timedelta(seconds=payload.get("expires_in", 0))).isoformat()
     if payload.get("refresh_token"):
         tokens["refresh_token"] = payload["refresh_token"]
-    write_tokens(cfg, tokens)
+    write_tokens(cfg, tokens, app)
     log("Access token refreshed.")
     return tokens
 

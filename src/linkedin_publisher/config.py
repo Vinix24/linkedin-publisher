@@ -22,6 +22,10 @@ RESERVED_FIELDS = {"status", "slot", "slot_time", "format", "alt_text", "video_t
                    "document_title", "posted_date", "linkedin_url"}
 
 
+COMMUNITY_SCOPES = ("r_basicprofile w_member_social w_member_social_feed "
+                    "r_member_postAnalytics r_member_profileAnalytics")
+
+
 class ConfigError(Exception):
     """The configuration file is missing or contains a value that cannot be used."""
 
@@ -68,6 +72,8 @@ class Config:
     check_timeout_seconds: float = 15
     external_route_field: str | None = None
     external_route_text: str | None = None
+    community_tokens_file: Path | None = None
+    community_scopes: str = COMMUNITY_SCOPES
 
 
 def find_config(explicit: str | None) -> Path | None:
@@ -169,6 +175,13 @@ def _external_route(approval: dict) -> tuple[str | None, str | None]:
     return route_field, route_text
 
 
+def _community_scopes(community: dict) -> str:
+    scopes = community.get("scopes", COMMUNITY_SCOPES)
+    if not isinstance(scopes, str) or not scopes.split():
+        raise ConfigError("community.scopes must be a space-separated string of scopes")
+    return " ".join(scopes.split())
+
+
 def load_config(explicit: str | None = None) -> Config:
     path = find_config(explicit)
     data: dict = {}
@@ -187,9 +200,9 @@ def load_config(explicit: str | None = None) -> Config:
     fm = data.get("frontmatter", {})
     slots = data.get("slots", {})
 
-    def resolve(key: str, default: str) -> Path:
+    def resolve(key: str, default: str, table: dict = paths) -> Path:
         # An absolute path in the config wins over root, which is what pathlib does.
-        return (root / Path(str(paths.get(key, default))).expanduser()).resolve()
+        return (root / Path(str(table.get(key, default))).expanduser()).resolve()
 
     default_time = _check_time(str(slots.get("default", "10:00")), "slots.default")
     slot_times = {}
@@ -210,6 +223,9 @@ def load_config(explicit: str | None = None) -> Config:
     expires_key = str(fm.get("expires_key", "expires"))
     names = _field_names(fm, expires_key)
     route_field, route_text = _external_route(approval)
+    community = data.get("community")
+    if community is not None and not isinstance(community, dict):
+        raise ConfigError("community must be a table, for example [community]")
 
     return Config(
         root=root,
@@ -244,4 +260,7 @@ def load_config(explicit: str | None = None) -> Config:
                                        "checks.timeout_seconds", 15),
         external_route_field=route_field,
         external_route_text=route_text,
+        community_tokens_file=resolve("tokens_file", ".linkedin-community-tokens.json", community)
+        if community is not None else None,
+        community_scopes=_community_scopes(community or {}),
     )
