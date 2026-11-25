@@ -992,6 +992,8 @@ def build_parser() -> argparse.ArgumentParser:
     look.add_argument("--dry-run", action="store_true", help="show the target, the payload and the digest; no network")
     look.add_argument("--verify", action="store_true",
                       help="read the comments back and look for this text from you; sends nothing")
+    look.add_argument("--retry-unclear", action="store_true",
+                      help="send again after an unclear attempt, once a person checked the comment is not there")
     return parser
 
 
@@ -1034,10 +1036,12 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_publish(cfg, now, mode, only, args.retry, args.require_approval, args.comment_retry)
         elif command == "comment":
             return linkcomment.run(cfg, args.on, args.text, args.text_file, args.text_digest, args.reply_to,
-                                   args.dry_run, args.verify)
+                                   args.dry_run, args.verify, args.retry_unclear)
         return 0
     except (ConfigError, api.PublisherError, schedule.ScheduleError, queue.QueueUnreadable) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
+        if command == "comment":
+            linkcomment.error_line(str(exc))
         return 1
     except requests.RequestException as exc:
         print(f"ERROR: could not reach LinkedIn: {exc}", file=sys.stderr)

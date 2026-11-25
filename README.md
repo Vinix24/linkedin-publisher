@@ -290,7 +290,7 @@ linkedin-publisher comment \
 ```
 
 - **The digest.** The text is normalized first: Unicode NFC, `\r\n` and `\r` become `\n`, and white
-  space at the start and the end goes. Nothing inside the text changes. The digest is sha256 as hex
+  space, U+FEFF and U+200B at the start and the end go. Nothing inside the text changes. The digest is sha256 as hex
   over the UTF-8 bytes, and the normalized text is what goes out. A missing digest, or one that does
   not match, is refused before the link is read or anything goes over the network. In Python:
   `from linkedin_publisher.textdigest import text_digest`. Another project can copy the test vectors
@@ -299,32 +299,51 @@ linkedin-publisher comment \
   `ugcPost` and `share`), `/posts/<slug>-share-<id>-<x>/` (also `-activity-` and `-ugcPost-`), and a
   link with `commentUrn` or `dashCommentUrn`. A link to a comment places an answer under it.
   `--reply-to <comment>` does the same with the post in `--on`, which must then be its activity.
-- A `lnkd.in` link is resolved with one GET that does not follow the redirect, and the address it
-  leads to is read as above. A dry run refuses it, since that is a network call.
+- A `lnkd.in` link is resolved over https, with one GET that does not follow the redirect, and the
+  address it leads to is read as above. A dry run refuses it, since that is a network call.
 - Any other form is refused. Nothing is guessed. An answer goes on the activity of the post, so only
   a comment whose URN is built on an activity can be answered. A link to an answer is refused too:
-  LinkedIn has one level of answers, so use the link of the comment it answers.
+  LinkedIn has one level of answers, so use the link of the comment it answers. A bare URN of an
+  answer looks the same as the URN of a comment and cannot be told apart: LinkedIn decides. A blank or
+  unknown comment parameter, and any fragment (`#...`), is refused.
 - `--dry-run` prints the target, the URL, the payload and the digest. It reads the community token
   file for the actor, and makes no network call and no receipt.
 - `--verify` reads every page of comments under the target and looks for one from your own actor
-  whose text has the same digest. It sends nothing and writes no receipt. An unclear answer is never
-  sent again by itself: read it back with `--verify` before anyone decides to send again.
-- Stdout gets one JSON line with `status` (`placed`, `found`, `not-found`, `dry-run`, `refused` or
-  `uncertain`), `comment_urn`, `target` and `digest`. A refusal or an unclear answer adds `error`.
+  whose text has the same digest. It sends nothing. When it finds the comment it writes a
+  `comment-placed` receipt with `"verified": true`, so no later run sends it again. When LinkedIn
+  refuses to list the comments (a 4xx: the app gets 403 under other people's posts) it is
+  `unverifiable`.
+- **Once.** After a `comment-attempt`, `comment-uncertain` or `comment-placed` receipt for the same
+  digest and target, nothing is sent again. That covers an unclear answer, a 201 without an id, a run
+  that died mid-request and a placed receipt that could not be written. Read it back with `--verify`.
+  When a person checked the comment is not there, `--retry-unclear` sends once more, and writes a
+  `comment-retry` receipt first. It is refused unless the latest receipt is an attempt or an unclear one.
+- **One run at a time.** A run takes a claim (`.receipts/claims/`) before it reads the receipts and
+  removes it after the outcome receipt. A second run that overlaps is refused. A claim left by a run
+  that died is taken over only with `--retry-unclear`, once its process is gone.
+- The digest and the target as given make the key of the receipts and the claim. The same post given
+  as a share link and as an activity URN are two targets, so use one link form per comment.
+- Stdout gets one JSON line on every path, with `status` (`placed`, `found`, `not-found`, `dry-run`,
+  `refused`, `uncertain`, `unverifiable` or `error`), `comment_urn`, `target` and `digest`. Anything
+  but a success adds `error`.
   Messages go to stderr. `comment_urn` is built on the activity of the post. For a post given as a
   ugcPost or a share it is the id LinkedIn returned.
 - Receipts: `comment-attempt` before the request, then `comment-placed`, `comment-failed` or
-  `comment-uncertain`, with the digest, the target and the comment URN, never a text. A
-  `comment-placed` receipt for the same digest and target refuses a second comment.
+  `comment-uncertain`, with the digest, the target and the comment URN, never a text.
+- In a test run `comment` refuses first, before it touches the token or writes a receipt. Only
+  `--dry-run` works there.
 
 | Code | Meaning |
 |---|---|
 | 0 | placed, or with `--verify` found |
+| 1 | error: something nobody foresaw, or a configuration that cannot be read. The JSON line says what |
 | 2 | refused, nothing was sent: the link, the digest, the community token, or LinkedIn answered 4xx |
 | 3 | unclear: the comment may be there. Look with `--verify` |
 | 4 | with `--verify`: not found |
+| 5 | unverifiable: with `--verify`, LinkedIn refused to list the comments |
 
-A usage error exits 2 as well, and a configuration that cannot be read exits 1. Neither sends anything.
+A usage error exits 2 as well, without a JSON line, and sends nothing. After exit 1, treat a
+`comment-attempt` receipt as unclear.
 
 ## Write a post
 

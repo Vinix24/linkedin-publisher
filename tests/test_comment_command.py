@@ -1,12 +1,15 @@
 """The comment command: the digest first, then the link, then one request. Nothing leaves this machine."""
 import json
+import os
 import re
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from conftest import CREDS, Setup
 
-from linkedin_publisher import api, linkcomment, links
+from linkedin_publisher import api, claims, cli, linkcomment, links
+from linkedin_publisher import postqueue as queue
 from linkedin_publisher.textdigest import text_digest
 
 P, C = "7400000000000000001", "7400000000000000002"
@@ -24,14 +27,18 @@ README = (Path(__file__).parents[1] / "README.md").read_text(encoding="utf-8")
 def community(tmp_path, monkeypatch):
     setup = Setup(tmp_path, '[community]\ntokens_file = "community.json"\n', hook=False)
     setup.cfg.community_tokens_file.write_text(json.dumps(TOKENS))
-    monkeypatch.setattr(api, "load_credentials", lambda _cfg, app="main": CREDS)
+    community_creds = {"LINKEDIN_COMMUNITY_CLIENT_ID": "x", "LINKEDIN_COMMUNITY_CLIENT_SECRET": "y"}
+    monkeypatch.setattr(api, "load_credentials", lambda _cfg, app="main": community_creds if app == "community" else CREDS)
     return setup
 
 
 @pytest.fixture
 def lp(tmp_path, monkeypatch):
-    """A community setup in which placing and reading are fakes that record what they were given."""
+    """A community setup in which placing and reading are fakes that record what they were given. The refusal
+    of a test run at the start of ``run`` is lifted, and only that one: the real place_comment, place_reply and
+    read_comments keep their own, and here they are replaced. The last tests run with nothing lifted."""
     setup = community(tmp_path, monkeypatch)
+    monkeypatch.setattr(linkcomment, "refuse_in_a_test_run", lambda: None)
     setup.calls = []
     monkeypatch.setattr(api, "place_comment", lambda _c, _cr, _t, urn, text, url=None:
                         setup.calls.append(("comment", urn, text)) or "901")
@@ -50,6 +57,13 @@ def run(setup, capsys, *args):
 
 def receipts(setup):
     return [json.loads(line) for f in sorted(setup.cfg.receipts_dir.glob("*.ndjson")) for line in f.read_text().splitlines()]
+
+
+def stages(setup):
+    return [row["stage"] for row in receipts(setup)]
+
+
+ARGS = ("--on", POST_LINK, "--text", TEXT, "--text-digest", DIGEST)
 
 
 def raising(exc):
@@ -156,28 +170,127 @@ def test_verify_reads_back_and_sends_nothing(lp, capsys, monkeypatch, elements, 
     monkeypatch.setattr(api, "read_comments", lambda _c, _cr, _t, target: read.append(target) or elements)
     got, out = run(lp, capsys, "--on", POST_LINK, "--text", TEXT, "--text-digest", DIGEST, "--verify")
     assert (got, out["status"], out["comment_urn"]) == (code, "found" if code == 0 else "not-found", urn)
-    assert read == [ACTIVITY] and lp.calls == [] and not lp.cfg.receipts_dir.exists()
+    assert read == [ACTIVITY] and lp.calls == []
+    assert [(r["stage"], r.get("verified"), r["comment_urn"]) for r in receipts(lp)] == (
+        [("comment-placed", True, urn)] if code == 0 else [])
+    assert run(lp, capsys, *ARGS)[0] == (2 if code == 0 else 0)          # a found comment is never sent again
 
 
-def test_verify_that_cannot_read_the_list_is_unclear(lp, capsys, monkeypatch):
-    monkeypatch.setattr(api, "read_comments", raising(api.PublishUncertain("no readable list")))
-    assert run(lp, capsys, "--on", COMMENT, "--text", TEXT, "--text-digest", DIGEST, "--verify")[0] == 3
+@pytest.mark.parametrize("failure, code, status", [
+    (api.PublishUncertain("no readable list"), 3, "uncertain"),
+    (api.PublisherError("LinkedIn refused to list the comments (403): no"), 5, "unverifiable"),
+])
+def test_verify_that_cannot_read_the_list(lp, capsys, monkeypatch, failure, code, status):
+    monkeypatch.setattr(api, "read_comments", raising(failure))
+    got, out = run(lp, capsys, "--on", COMMENT, "--text", TEXT, "--text-digest", DIGEST, "--verify")
+    assert (got, out["status"]) == (code, status) and stages(lp) == []
+
+
+@pytest.mark.parametrize("left", ["comment-attempt", "comment-uncertain"])
+def test_after_an_unclear_attempt_only_retry_unclear_sends_again(lp, capsys, left):
+    linkcomment.receipt(lp.cfg, left, links.parse_target(POST_LINK), DIGEST)     # died mid-request, or no clear answer
+    code, out = run(lp, capsys, *ARGS)
+    assert (code, lp.calls) == (2, []) and "--verify" in out["error"] and "--retry-unclear" in out["error"]
+    assert run(lp, capsys, *ARGS, "--retry-unclear")[0] == 0 and lp.calls == [("comment", ACTIVITY, TEXT)]
+    assert stages(lp) == [left, "comment-retry", "comment-attempt", "comment-placed"]
+    code, out = run(lp, capsys, *ARGS, "--retry-unclear")
+    assert code == 2 and "latest receipt here is comment-placed" in out["error"] and len(lp.calls) == 1
+
+
+@pytest.mark.parametrize("left", [None, "comment-failed"])
+def test_retry_unclear_needs_an_unclear_attempt(lp, capsys, left):
+    if left:
+        linkcomment.receipt(lp.cfg, left, links.parse_target(POST_LINK), DIGEST)
+    code, out = run(lp, capsys, *ARGS, "--retry-unclear")
+    assert (code, lp.calls) == (2, []) and "only for an unclear earlier attempt" in out["error"]
+
+
+def test_two_unclear_runs_send_once(lp, capsys, monkeypatch):
+    monkeypatch.setattr(api, "place_comment", lambda *_a, **_k: lp.calls.append("sent") or raising(
+        api.PublishUncertain("LinkedIn accepted the comment but returned no id."))())
+    assert [run(lp, capsys, *ARGS)[0] for _ in range(2)] == [3, 2] and lp.calls == ["sent"]
+
+
+def test_a_placed_receipt_that_cannot_be_written_still_refuses_a_rerun(lp, capsys, monkeypatch):
+    real = queue.write_receipt
+    monkeypatch.setattr(queue, "write_receipt", lambda cfg, stage, *a, **k: (
+        raising(OSError("disk full"))() if stage == "comment-placed" else real(cfg, stage, *a, **k)))
+    assert run(lp, capsys, *ARGS)[0] == 0
+    code, out = run(lp, capsys, *ARGS)
+    assert code == 2 and "may have gone through (comment-attempt)" in out["error"] and len(lp.calls) == 1
+
+
+def test_an_overlapping_run_is_kept_out_by_the_claim(lp, capsys, monkeypatch):
+    inner = []
+
+    def place_comment(*_a, **_k):
+        inner.append(lp.run("comment", *ARGS))          # a second run, while the first one is sending
+        lp.calls.append("sent")
+        return "901"
+
+    monkeypatch.setattr(api, "place_comment", place_comment)
+    assert lp.run("comment", *ARGS) == 0 and inner == [2] and lp.calls == ["sent"]
+    second, first = (json.loads(line) for line in capsys.readouterr().out.splitlines())
+    assert "holds the claim" in second["error"] and first["status"] == "placed"
+    assert claims.keys(lp.cfg) == []                    # gone after the outcome: the receipts guard from here
+
+
+def test_a_claim_of_a_live_process_keeps_out_a_retry_too(lp, capsys):
+    ckey = linkcomment.claim_key(links.parse_target(POST_LINK), DIGEST)
+    assert claims.take(lp.cfg, ckey, "another run")
+    claims.claim_path(lp.cfg, ckey).write_text(json.dumps({"pid": os.getppid(), "claimed_at": "2026-01-01T00:00:00+00:00"}))
+    for extra in ((), ("--retry-unclear",)):
+        code, out = run(lp, capsys, *ARGS, *extra)
+        assert code == 2 and "claim" in out["error"]
+    assert lp.calls == [] and stages(lp) == [] and claims.exists(lp.cfg, ckey)
+
+
+def test_every_failure_ends_in_the_json_line(lp, capsys, monkeypatch, tmp_path):
+    lp.cfg.community_tokens_file.write_text(json.dumps({k: v for k, v in TOKENS.items() if k != "access_token"}))
+    code, out = run(lp, capsys, *ARGS)
+    assert code == 2 and "access_token" in out["error"]
+    expired = {**TOKENS, "access_expires_at": "2000-01-01T00:00:00", "refresh_token": "r"}
+    lp.cfg.community_tokens_file.write_text(json.dumps(expired))
+    monkeypatch.setattr(api.requests, "post", lambda *_a, **_k: SimpleNamespace(status_code=200, json=dict))
+    code, out = run(lp, capsys, *ARGS)                  # a refresh answer without an access token
+    assert code == 2 and "access_token" in out["error"]
+    assert json.loads(lp.cfg.community_tokens_file.read_text()) == expired
+    (lp.cfg.receipts_dir / "2026-01-01.ndjson").write_bytes(b"\xff\xfe not UTF-8\n")
+    code, out = run(lp, capsys, *ARGS)
+    assert (code, out["status"]) == (1, "error") and "UnicodeDecodeError" in out["error"] and lp.calls == []
+    assert cli.main(["--config", str(tmp_path / "missing.toml"), "comment", *ARGS]) == 1
+    assert json.loads(capsys.readouterr().out)["status"] == "error"
+
+
+@pytest.mark.parametrize("extra", [(), ("--verify",), ("--retry-unclear",)])
+def test_a_test_run_is_refused_before_any_token_work_or_receipt(tmp_path, capsys, monkeypatch, extra):
+    """Nothing lifted. The token file is not read, refreshed or written, and no receipt is written."""
+    setup = community(tmp_path, monkeypatch)
+    before = setup.cfg.community_tokens_file.read_bytes()
+    for name in ("community_problem", "load_credentials", "read_tokens", "ensure_access_token", "write_tokens"):
+        monkeypatch.setattr(api, name, lambda *_a, **_k: pytest.fail("token work in a test run"))
+    code, out = run(setup, capsys, "--on", COMMENT_LINK, "--text", TEXT, "--text-digest", DIGEST, *extra)
+    assert (code, out["status"]) == (2, "refused") and "from a test run" in out["error"]
+    assert setup.cfg.community_tokens_file.read_bytes() == before and not setup.cfg.receipts_dir.exists()
 
 
 @pytest.mark.parametrize("on", [POST_LINK, COMMENT_LINK])
-def test_without_dry_run_a_test_run_sends_nothing(tmp_path, capsys, monkeypatch, on):
+def test_with_the_first_refusal_lifted_place_comment_and_place_reply_still_refuse(tmp_path, capsys, monkeypatch, on):
     """The real place_comment and place_reply, the real token file: only the network is replaced, by a trap."""
     setup = community(tmp_path, monkeypatch)
+    monkeypatch.setattr(linkcomment, "refuse_in_a_test_run", lambda: None)
     monkeypatch.setattr(api.requests, "post", lambda *_a, **_k: pytest.fail("a request was sent"))
     code, out = run(setup, capsys, "--on", on, "--text", TEXT, "--text-digest", DIGEST)
     assert (code, out["status"]) == (2, "refused") and "from a test run" in out["error"]
-    assert [row["stage"] for row in receipts(setup)] == ["comment-attempt", "comment-failed"]
+    assert stages(setup) == ["comment-attempt", "comment-failed"]
 
 
 def test_the_exit_codes_are_the_ones_in_the_readme():
-    assert linkcomment.EXIT_CODES == {"placed": 0, "found": 0, "dry-run": 0, "refused": 2, "uncertain": 3, "not-found": 4}
+    assert linkcomment.EXIT_CODES == {"placed": 0, "found": 0, "dry-run": 0, "error": 1, "refused": 2, "uncertain": 3,
+                                      "not-found": 4, "unverifiable": 5}
     section = README.split("## Comment from a link\n", 1)[1].split("\n## ", 1)[0]
     rows = dict(re.findall(r"^\| ([0-9]) \| (.+) \|$", section, flags=re.MULTILINE))
     assert sorted(map(int, rows)) == sorted(set(linkcomment.EXIT_CODES.values()))
     assert "placed" in rows["0"] and "found" in rows["0"] and rows["2"].startswith("refused")
     assert rows["3"].startswith("unclear") and rows["4"].endswith("not found")
+    assert rows["1"].startswith("error") and rows["5"].startswith("unverifiable")
