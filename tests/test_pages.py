@@ -51,6 +51,7 @@ def test_a_page_is_a_name_and_an_organization_urn(tmp_path):
 @pytest.mark.parametrize("line", ['organization = "urn:li:organization:"', 'organization = "urn:li:organization:12a"',
                                   'organization = "urn:li:person:123"', 'organization = "urn:li:organization:123\\n"',
                                   'organization = " urn:li:organization:123"', 'organization = "urn:li:organization:١٢"',
+                                  'organization = "urn:li:organization:0123"', 'organization = "urn:li:organization:0"',
                                   "organization = 123", 'name = "acme"'])
 def test_an_organization_that_is_not_an_organization_urn_is_refused(tmp_path, line):
     with pytest.raises(ConfigError, match=r"pages\.acme\.organization must be the URN"):
@@ -98,6 +99,19 @@ def test_a_page_post_is_not_sent_without_the_page_scope(pages):
     assert pages.run("publish", "--post", "--file", str(path)) == 1
     assert pages.sends == [] and pages.receipt_stages() == ["failed"] and path.exists()
     assert not claims.exists(pages.cfg, queue.post_key(queue.read_post(path), pages.cfg))
+
+
+def test_a_page_post_the_token_cannot_send_does_not_hold_up_a_member_post(pages):
+    """The page post comes first in the queue. Taken first, it would fail after its claim on every run."""
+    pages.cfg.community_tokens_file.write_text(json.dumps({**PAGE_TOKENS, "scope": "r_basicprofile w_member_social"}))
+    page = pages.post("a.md", {"author": "acme"}, body="Page text.")
+    pages.post("b.md", body="Member text.")
+    codes = [cli.cmd_publish(pages.cfg, WEDNESDAY_10 + dt.timedelta(minutes=m), "post", None) for m in (5, 20, 35)]
+    assert codes == [3, 0, 0] and [s["author"] for s in pages.sends] == [None]
+    assert "Member text" in pages.sends[0]["commentary"] and page.exists()
+    assert pages.receipt_stages() == ["page-problem", "attempt", "placed"]   # the page post: one note, never tried
+    assert pages.titles() == [cli.PAGE_HELD_TITLE, "LinkedIn post is live"]
+    assert not claims.exists(pages.cfg, queue.post_key(queue.read_post(page), pages.cfg))
 
 
 def test_an_unknown_page_is_reported_by_precheck_and_never_sent(pages, capsys):
@@ -159,7 +173,8 @@ def test_the_receipts_know_a_post_by_its_text_and_its_page(pages):
     page = pages.post("page.md", {"author": "acme"})
     assert [p.path for p in queue.collect(pages.cfg, SLOT_PLUS_5)[0]] == [page]    # same text, other author: free
     assert cli.cmd_publish(pages.cfg, SLOT_PLUS_5, "post", None) == 0
-    assert [s["author"] for s in pages.sends] == [None, ORG] and pages.apps == ["main", "community"]
+    assert [s["author"] for s in pages.sends] == [None, ORG]
+    assert pages.apps.count("main") == 1 and pages.apps[-1] == "community"      # the page post read the community token
     pages.post("renamed.md", {"author": "acme-bv"})
     beta = pages.post("beta.md", {"author": "beta"})
     ready, skipped = queue.collect(pages.cfg, SLOT_PLUS_5)

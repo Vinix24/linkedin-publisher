@@ -450,6 +450,37 @@ def apply_checks(cfg: Config, ready: list, log) -> tuple[list, int, int]:
     return [], held, 3 if reported else 0
 
 
+PAGE_HELD_TITLE = "LinkedIn post held back: it cannot go out as the page"
+
+
+def drop_page_problems(cfg: Config, ready: list, now: dt.datetime, log) -> tuple[list, int]:
+    """Leave out the due page posts that the community token cannot send, before one post is chosen.
+
+    Without this a page post would be taken first and fail after its claim on every run, while a post as
+    the member due in the same window never went out. Each one left out gets a line in the log on every
+    run, and is reported once per problem with a note in the receipts and a notification.
+    Returns (the posts that remain, 3 when there was something new to report)."""
+    problem = api.page_problem(cfg, now) if any(queue.page_name(post) for post in ready) else None
+    if not problem:
+        return ready, 0
+    noted = queue.load_notes(cfg, "page-problem")
+    keep, reported = [], 0
+    for post in ready:
+        if not queue.page_name(post):
+            keep.append(post)
+            continue
+        message = f"{post.path.stem} goes out as page {queue.page_name(post)}, but {problem}"
+        log(f"Not posting {post.path.name}. {message}")
+        key = queue.post_key(post, cfg)
+        if (key, problem) in noted:
+            continue
+        noted.add((key, problem))
+        queue.write_receipt(cfg, "page-problem", post, ref=problem, error=problem)
+        alert(cfg, PAGE_HELD_TITLE, message)
+        reported += 1
+    return keep, 3 if reported else 0
+
+
 def media_line(post) -> str:
     fmt = post.meta.get("format", "text")
     if fmt in ("video", "document"):
@@ -462,10 +493,12 @@ def media_line(post) -> str:
     return f"image: {post.image.name if post.image else 'none'}"
 
 
-def held_back_line(unapproved: int, failing_checks: int, external: int = 0) -> str:
+def held_back_line(unapproved: int, failing_checks: int, external: int = 0, pages: int = 0) -> str:
     reasons = []
     if unapproved:
         reasons.append(f"{unapproved} without a valid approval")
+    if pages:
+        reasons.append(f"{pages} that cannot go out as their page")
     if failing_checks:
         reasons.append(f"{failing_checks} with a failing check")
     if not reasons:
@@ -514,7 +547,8 @@ def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None, ret
     receipt. The person hears about it through ``alert``, once per run.
 
     Returns 0, 1 for a run that could not do its work, or 3 when it found something new to
-    report (a missed slot, a claim without an outcome, a post that needs approval)."""
+    report (a missed slot, a claim without an outcome, a post that needs approval, a page post the
+    community token cannot send)."""
     if require_approval and not cfg.approval_required:
         alert(cfg, REQUIRE_APPROVAL_TITLE, REQUIRE_APPROVAL_MESSAGE)
         raise api.PublisherError(REQUIRE_APPROVAL_MESSAGE)
@@ -562,7 +596,7 @@ def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None, ret
         if mode in ("notify", "post"):
             report_code = report_new_stranded(cfg, skipped, log)
             report_code = report_unresolved_claims(cfg, now, log) or report_code
-        unapproved_count = check_held = external_count = 0
+        unapproved_count = check_held = external_count = page_held = 0
         if mode == "post" and cfg.approval_required:
             # Before anything is sent: a due post goes out only when a person approved this version.
             due_count = len(ready)
@@ -570,13 +604,19 @@ def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None, ret
             ready, unapproved = apply_approval(cfg, ready, log)
             report_code = report_code or unapproved
             unapproved_count = due_count - len(ready) - external_count
+        if mode in ("notify", "post"):
+            # Before one post is chosen: a page post the community token cannot send must not hold up the rest.
+            due_count = len(ready)
+            ready, page_report = drop_page_problems(cfg, ready, now, log)
+            page_held = due_count - len(ready)
+            report_code = report_code or page_report
         if mode == "post":
             # After the approval and before the claim: the addresses the post names must answer.
             ready, check_held, failed_checks = apply_checks(cfg, ready, log)
             report_code = report_code or failed_checks
         if not ready:
             if mode != "notify":
-                print(held_back_line(unapproved_count, check_held, external_count))
+                print(held_back_line(unapproved_count, check_held, external_count, page_held))
             return report_code
         post = ready[0]  # one post per run
         if len(ready) > 1:

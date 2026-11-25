@@ -27,7 +27,7 @@ COMMUNITY_SCOPES = ("r_basicprofile w_member_social w_member_social_feed "
                     "r_member_postAnalytics r_member_profileAnalytics")
 # Posting as a page. Asked for only when a page is configured, so a community login without pages keeps its scopes.
 PAGE_SCOPE = "w_organization_social"
-ORGANIZATION_RE = re.compile(r"urn:li:organization:[0-9]+")
+ORGANIZATION_RE = re.compile(r"urn:li:organization:[1-9][0-9]*")    # an id, so no leading zero
 
 
 DELAY_RE = re.compile(r"^(0|[1-9]\d*)([mh])$")

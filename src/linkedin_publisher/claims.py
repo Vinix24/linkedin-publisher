@@ -10,7 +10,9 @@ A run takes the claim after the receipt checks and before the ``attempt`` receip
 first call to LinkedIn. After ``placed`` the claim stays for good. After ``failed`` and
 ``preflight-rejected`` nothing was sent, so the claim is removed. After ``uncertain`` or a
 crash it stays, and only a person who checked LinkedIn takes it over, with ``--retry``.
-A second route that implements the same file contract shares these claims.
+A second route that implements the same file contract shares these claims for posts as the member.
+A page post is keyed with its organization URN as well (``postqueue.post_key``): for a page post, a
+route that keys its claims by the text alone and this tool do not see each other's claims.
 """
 from __future__ import annotations
 

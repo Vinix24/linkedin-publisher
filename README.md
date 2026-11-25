@@ -199,8 +199,10 @@ tested on the Development Tier yet, so LinkedIn may refuse it there.
    [pages.acme]
    organization = "urn:li:organization:123456"
    ```
-3. Run `linkedin-publisher auth --app community` again. With a page configured it also asks for
-   `w_organization_social`. Until then `status` and `precheck` say that the token lacks it.
+3. Run `linkedin-publisher auth --app community` again. With `[pages]` set it also asks for
+   `w_organization_social`. Until then `status` and `precheck` say that the token lacks it. If
+   LinkedIn refuses that scope, the whole community login fails, the first comment included: remove
+   `[pages]` again in that case.
 4. Put `author: acme` in the frontmatter of the post. Without `author` the post goes out as you,
    exactly as before. A name that is not configured refuses the post: `precheck` reports it and
    `publish` never sends it.
@@ -213,6 +215,10 @@ tested on the Development Tier yet, so LinkedIn may refuse it there.
 - A page post cannot have a first comment (the token would place it as you): it is refused.
 - `due`, `precheck` and a dry run show `as page acme`, and `precheck --json` adds `"author": "acme"`.
   `status` lists the pages.
+- A scheduled run leaves out a due page post that the community token cannot send and says so once
+  through `[notify]`. A post as you that is due in the same window still goes out.
+- The mission-control publish route does not post as a page: from its next version on it refuses a
+  post with `author`. Another program shares the claims only for posts as you (see *One post, one claim*).
 
 ## First comment
 
@@ -503,7 +509,8 @@ remove the file yourself after you checked LinkedIn.
 
 Another program that places posts in the same folder takes part by following the same file
 contract: same path, same `O_EXCL` creation, same JSON, and the same rule that a `placed`
-claim stays.
+claim stays. That holds for posts as you. The key of a page post also covers its organization URN,
+so a program that keys by the text alone does not see those claims.
 
 ## A number that is measured
 
@@ -551,9 +558,10 @@ It runs the command with its timeout, and writes only the digits into the file, 
 Nothing else in the file changes, not even a line ending. It writes a `measured` note with the old
 and the new number (`53->49`). It never posts, and `publish --post` never measures by itself.
 
-The identity of a post in the receipts and the claims is a hash of its text, digits included. A
-number changed after something was tried with that text would be a post that no receipt and no
-claim knows, and it could go out a second time. So `measure` leaves a post alone, per post, when:
+The identity of a post in the receipts and the claims is a hash of its text, digits included, and
+for a page post of its organization URN too (see *Post as a company page*). A number changed after
+something was tried with that text would be a post that no receipt and no claim knows, and it could
+go out a second time. So `measure` leaves a post alone, per post, when:
 
 | | |
 |---|---|
@@ -660,7 +668,8 @@ The JSON has a fixed shape:
 ```
 
 `kind` is one of `approval-missing`, `approval-mismatch`, `measure-line`, `media`, `content`,
-`expired`, `blocked`, `check-failed`.
+`expired`, `blocked`, `comment`, `page`, `check-failed`. `page` means a page post that the community
+token cannot send: no token, an expired one, or one without `w_organization_social`.
 
 **Posts that run somewhere else.** While you move posts over from another way of posting, some
 posts do not run through this tool's schedule and have no approval in the file. Name the field and
