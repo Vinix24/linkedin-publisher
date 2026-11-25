@@ -271,6 +271,61 @@ comment_delay: 30m
 - `due` and `status` list the scheduled comments and when they are due. `precheck` reports a
   scheduled comment whose community token will not be valid at its due time.
 
+## Comment from a link
+
+`comment` places a comment under a post, or an answer under a comment, from a link copied from
+LinkedIn. It is meant for a job that holds a text a person approved: the command takes the digest of
+that text and refuses any other. It uses the community token, as the first comment does. Without
+`--dry-run` it places the comment.
+
+```bash
+linkedin-publisher comment \
+  --on 'https://www.linkedin.com/feed/update/urn:li:activity:7400000000000000001/?commentUrn=urn%3Ali%3Acomment%3A%28activity%3A7400000000000000001%2C7400000000000000002%29' \
+  --text-file reply.txt \
+  --text-digest 465868f4e9e84a4055a39a31d5b81c0a55906ba84f62f1059d259f99e6f4eaa1 --dry-run
+```
+
+```
+{"status": "dry-run", "comment_urn": null, "target": "urn:li:comment:(urn:li:activity:7400000000000000001,7400000000000000002)", "digest": "465868f4...", "url": "https://api.linkedin.com/rest/socialActions/...", "payload": {"actor": "urn:li:person:...", "object": "urn:li:activity:7400000000000000001", "parentComment": "urn:li:comment:(urn:li:activity:7400000000000000001,7400000000000000002)", "message": {"text": "Dank voor je reactie."}}}
+```
+
+- **The digest.** The text is normalized first: Unicode NFC, `\r\n` and `\r` become `\n`, and white
+  space at the start and the end goes. Nothing inside the text changes. The digest is sha256 as hex
+  over the UTF-8 bytes, and the normalized text is what goes out. A missing digest, or one that does
+  not match, is refused before the link is read or anything goes over the network. In Python:
+  `from linkedin_publisher.textdigest import text_digest`. Another project can copy the test vectors
+  in `tests/data/text_digest_vectors.json`.
+- **The target.** `--on` takes a link or a bare URN: `/feed/update/urn:li:activity:<id>/` (also
+  `ugcPost` and `share`), `/posts/<slug>-share-<id>-<x>/` (also `-activity-` and `-ugcPost-`), and a
+  link with `commentUrn` or `dashCommentUrn`. A link to a comment places an answer under it.
+  `--reply-to <comment>` does the same with the post in `--on`, which must then be its activity.
+- A `lnkd.in` link is resolved with one GET that does not follow the redirect, and the address it
+  leads to is read as above. A dry run refuses it, since that is a network call.
+- Any other form is refused. Nothing is guessed. An answer goes on the activity of the post, so only
+  a comment whose URN is built on an activity can be answered. A link to an answer is refused too:
+  LinkedIn has one level of answers, so use the link of the comment it answers.
+- `--dry-run` prints the target, the URL, the payload and the digest. It reads the community token
+  file for the actor, and makes no network call and no receipt.
+- `--verify` reads every page of comments under the target and looks for one from your own actor
+  whose text has the same digest. It sends nothing and writes no receipt. An unclear answer is never
+  sent again by itself: read it back with `--verify` before anyone decides to send again.
+- Stdout gets one JSON line with `status` (`placed`, `found`, `not-found`, `dry-run`, `refused` or
+  `uncertain`), `comment_urn`, `target` and `digest`. A refusal or an unclear answer adds `error`.
+  Messages go to stderr. `comment_urn` is built on the activity of the post. For a post given as a
+  ugcPost or a share it is the id LinkedIn returned.
+- Receipts: `comment-attempt` before the request, then `comment-placed`, `comment-failed` or
+  `comment-uncertain`, with the digest, the target and the comment URN, never a text. A
+  `comment-placed` receipt for the same digest and target refuses a second comment.
+
+| Code | Meaning |
+|---|---|
+| 0 | placed, or with `--verify` found |
+| 2 | refused, nothing was sent: the link, the digest, the community token, or LinkedIn answered 4xx |
+| 3 | unclear: the comment may be there. Look with `--verify` |
+| 4 | with `--verify`: not found |
+
+A usage error exits 2 as well, and a configuration that cannot be read exits 1. Neither sends anything.
+
 ## Write a post
 
 ```markdown

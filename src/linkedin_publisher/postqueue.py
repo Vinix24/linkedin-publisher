@@ -394,13 +394,13 @@ def move_to_published(post: Post, cfg: Config, post_url: str, posted_on: dt.date
 def write_receipt(cfg: Config, stage: str, post: Post | None = None, *,
                   post_urn: str | None = None, post_url: str | None = None,
                   error: str | None = None, key: str | None = None, file_name: str | None = None,
-                  ref: str | None = None) -> None:
+                  ref: str | None = None, fields: dict[str, Any] | None = None) -> None:
     """Append-only NDJSON, one file per day.
 
     stage: attempt | placed | uncertain | failed | preflight-rejected | move-failed | one of
     NOTE_STAGES (the comment stages included; their ref is the comment id). Without a post, key and file_name say which post it is about (a claim has
     no post file to read). ref says which version of the subject a note is about, so a note
-    is written once per version and not once per run."""
+    is written once per version and not once per run. fields are added to the row as they are."""
     now = dt.datetime.now(dt.UTC)
     row: dict[str, Any] = {
         "event": "linkedin_publish",
@@ -414,6 +414,7 @@ def write_receipt(cfg: Config, stage: str, post: Post | None = None, *,
     }
     if ref is not None:
         row["ref"] = ref
+    row.update(fields or {})
     cfg.receipts_dir.mkdir(parents=True, exist_ok=True)
     with (cfg.receipts_dir / f"{now:%Y-%m-%d}.ndjson").open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(row) + "\n")

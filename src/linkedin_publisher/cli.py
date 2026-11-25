@@ -14,8 +14,8 @@ from pathlib import Path
 
 import requests
 
-from . import (__version__, api, approval, checks, claims, cloud, firstcomment, littletext, measures,
-               precheck, postqueue as queue, schedule, templates)
+from . import (__version__, api, approval, checks, claims, cloud, firstcomment, linkcomment, littletext,
+               measures, precheck, postqueue as queue, schedule, templates)
 from .config import DEFAULT_CONFIG_NAME, Config, ConfigError, load_config
 
 TOKEN_WARN_DAYS = 7
@@ -980,6 +980,18 @@ def build_parser() -> argparse.ArgumentParser:
                           "LinkedIn. Refused when a receipt shows the comment was placed")
     pub.add_argument("--retry", action="store_true",
                      help="with --file: try again after an unclear outcome, once you checked LinkedIn")
+    com = sub.add_parser("comment", help="place a comment, or an answer under a comment, from a link; only with "
+                                         "the digest of the approved text. One JSON line; exit 0, 2, 3 or 4")
+    com.add_argument("--on", required=True, metavar="LINK", help="link or URN of the post, or of the comment to answer")
+    text = com.add_mutually_exclusive_group(required=True)
+    text.add_argument("--text", help="the text of the comment")
+    text.add_argument("--text-file", metavar="PATH", help="a UTF-8 file with the text of the comment")
+    com.add_argument("--text-digest", metavar="HEX", help="required: sha256 of the approved text after normalization")
+    com.add_argument("--reply-to", metavar="LINK", help="link or URN of a comment under the post in --on: answer it")
+    look = com.add_mutually_exclusive_group()
+    look.add_argument("--dry-run", action="store_true", help="show the target, the payload and the digest; no network")
+    look.add_argument("--verify", action="store_true",
+                      help="read the comments back and look for this text from you; sends nothing")
     return parser
 
 
@@ -1020,6 +1032,9 @@ def main(argv: list[str] | None = None) -> int:
                 raise api.PublisherError("--comment-retry stands alone with --file: it takes neither "
                                          "--retry, --post nor --notify.")
             return cmd_publish(cfg, now, mode, only, args.retry, args.require_approval, args.comment_retry)
+        elif command == "comment":
+            return linkcomment.run(cfg, args.on, args.text, args.text_file, args.text_digest, args.reply_to,
+                                   args.dry_run, args.verify)
         return 0
     except (ConfigError, api.PublisherError, schedule.ScheduleError, queue.QueueUnreadable) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
