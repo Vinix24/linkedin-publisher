@@ -20,11 +20,27 @@ FIELD_OPTIONS = (("approved_by_field", "approved_by"), ("approved_at_field", "ap
 # Names the tool itself reads or writes in a post file. A field of ours must not be one of them.
 RESERVED_FIELDS = {"status", "slot", "slot_time", "format", "alt_text", "video_title",
                    "document_title", "posted_date", "linkedin_url", "comment_status",
-                   "comment_urn", "comment_error"}
+                   "comment_urn", "comment_error", "comment_delay", "comment_due"}
 
 
 COMMUNITY_SCOPES = ("r_basicprofile w_member_social w_member_social_feed "
                     "r_member_postAnalytics r_member_profileAnalytics")
+
+
+DELAY_RE = re.compile(r"^(0|[1-9]\d*)([mh])$")
+
+
+def parse_delay(value: object) -> int:
+    """A comment delay in minutes. ``0`` or a whole number with ``m`` or ``h``: ``30m``, ``1h``, ``90m``.
+    Raises ValueError with a message that says what is accepted."""
+    text = str(value).strip().strip('"\'')
+    if text == "0":
+        return 0
+    match = DELAY_RE.match(text)
+    if not match:
+        raise ValueError(f"{text!r} is not a delay. Use 0, or a whole number of minutes or hours: 30m, 90m, 1h, 2h")
+    number = int(match.group(1))
+    return number * 60 if match.group(2) == "h" else number
 
 
 class ConfigError(Exception):
@@ -75,6 +91,7 @@ class Config:
     external_route_text: str | None = None
     community_tokens_file: Path | None = None
     community_scopes: str = COMMUNITY_SCOPES
+    comment_delay_minutes: int = 0
 
 
 def find_config(explicit: str | None) -> Path | None:
@@ -183,6 +200,13 @@ def _community_scopes(community: dict) -> str:
     return " ".join(scopes.split())
 
 
+def _comment_delay(community: dict) -> int:
+    try:
+        return parse_delay(community.get("comment_delay", "0"))
+    except ValueError as exc:
+        raise ConfigError(f"community.comment_delay: {exc}") from exc
+
+
 def load_config(explicit: str | None = None) -> Config:
     path = find_config(explicit)
     data: dict = {}
@@ -264,4 +288,5 @@ def load_config(explicit: str | None = None) -> Config:
         community_tokens_file=resolve("tokens_file", ".linkedin-community-tokens.json", community)
         if community is not None else None,
         community_scopes=_community_scopes(community or {}),
+        comment_delay_minutes=_comment_delay(community or {}),
     )

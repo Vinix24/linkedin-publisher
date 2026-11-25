@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from . import claims, frontmatter, littletext
-from .config import TIME_RE, Config
+from .config import TIME_RE, Config, parse_delay
 
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif")
 VIDEO_SUFFIXES = (".mp4",)
@@ -49,6 +49,13 @@ COMMENT_SUFFIX = ".comment.md"
 def comment_path_for(md_path: Path) -> Path:
     """The first comment of a post is a file with the same name: post.md + post.comment.md."""
     return md_path.with_name(md_path.stem + COMMENT_SUFFIX)
+
+
+def comment_delay(post: Post, cfg: Config) -> int:
+    """Minutes between the post and its first comment: the post's ``comment_delay`` field, else the
+    ``[community] comment_delay`` default. Raises ValueError when the field is not a delay."""
+    raw = post.meta.get("comment_delay")
+    return cfg.comment_delay_minutes if raw is None or not raw.strip() else parse_delay(raw)
 
 
 def find_image(md_path: Path) -> Path | None:
@@ -159,6 +166,11 @@ def content_problem(post: Post, cfg: Config) -> str | None:
         return "empty post text"
     if post.comment_path and not post.comment:
         return f"{post.comment_path.name} is empty. Write the first comment in it, or remove the file"
+    if "comment_delay" in post.meta:
+        try:
+            parse_delay(post.meta["comment_delay"] or "")
+        except ValueError as exc:
+            return f"comment_delay: {exc}"
     if post.meta.get("format") == "image":
         if not post.image:
             return "format is image but there is no image file next to the post"
@@ -381,8 +393,10 @@ def write_receipt(cfg: Config, stage: str, post: Post | None = None, *,
 UNCERTAIN_STAGES = {"attempt", "uncertain"}
 # Notes tell a person something once. They are not outcomes and must never stand in for one.
 COMMENT_STAGES = frozenset({"comment-attempt", "comment-placed", "comment-failed", "comment-uncertain"})
+# A scheduled comment is a note about the future, not an outcome: it never counts as placed or attempted.
 NOTE_STAGES = frozenset({"stranded", "approval-missing", "approval-mismatch", "claim-unresolved",
-                         "measured", "measure-failed", "check-failed", "precheck"}) | COMMENT_STAGES
+                         "measured", "measure-failed", "check-failed", "precheck",
+                         "comment-scheduled"}) | COMMENT_STAGES
 
 
 def _receipt_rows(cfg: Config):

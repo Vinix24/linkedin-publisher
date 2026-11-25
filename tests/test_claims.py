@@ -623,7 +623,7 @@ def test_a_claim_without_content_is_read_by_its_age(setup):
 
 NOTES = ["stranded", "approval-missing", "approval-mismatch", "claim-unresolved",
          "measured", "measure-failed", "check-failed", "precheck",
-         "comment-attempt", "comment-placed", "comment-failed", "comment-uncertain"]
+         "comment-attempt", "comment-placed", "comment-failed", "comment-uncertain", "comment-scheduled"]
 
 
 def test_every_note_stage_is_covered_by_the_tests_below():
