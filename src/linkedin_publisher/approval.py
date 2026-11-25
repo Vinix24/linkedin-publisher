@@ -28,6 +28,15 @@ KEY_VERSION = b"linkedin-publisher approval key v1\n"
 CHUNK = 1024 * 1024
 
 
+def effective_delay(post: queue.Post, cfg: Config) -> int:
+    """The comment delay in minutes. A field that is not a delay counts as none here: the post is
+    refused as a content problem before anything is approved or sent."""
+    try:
+        return queue.comment_delay(post, cfg)
+    except ValueError:
+        return 0
+
+
 def approval_key(post: queue.Post, cfg: Config) -> str:
     """sha256 over what goes out, nothing else.
 
@@ -37,7 +46,8 @@ def approval_key(post: queue.Post, cfg: Config) -> str:
     it either, because it is never sent. Everything is length-prefixed, so two different posts
     cannot produce the same bytes by moving text from one part to the next.
 
-    The first comment (``post.comment.md``) is part of what goes out: it is in the key when there is one.
+    The first comment (``post.comment.md``) is part of what goes out: it is in the key when there is one,
+    and so is its delay when the post has a comment and the delay is not zero.
     A post without a comment is hashed exactly as before.
 
     A post with a measure line is hashed with the digits of the measured number replaced by a
@@ -65,6 +75,9 @@ def approval_key(post: queue.Post, cfg: Config) -> str:
         part("alt_text", (out.alt_text or "").encode("utf-8"))
     if post.comment:
         part("comment", post.comment.encode("utf-8"))   # only when there is one: other posts hash as before
+        delay = effective_delay(post, cfg)
+        if delay:
+            part("comment_delay", str(delay).encode("ascii"))   # only a delay that exists: no delay hashes as before
     if out.video or out.document:
         part("title", (out.title or "").encode("utf-8"))
     for label, media in (("image", out.image), ("video", out.video), ("document", out.document)):
