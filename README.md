@@ -46,9 +46,10 @@ takes a *claim* on the post, a file that only one run can create. See *One post,
 | One MP4 video per post, up to 500 MB | Polls |
 | One PDF per post (a document or carousel), up to 100 MB and 300 pages | Posting as a company page |
 | Posting as yourself (your personal profile) | Scheduling inside LinkedIn itself |
-| Markdown in your files (converted to plain text) | |
-| Hashtags | |
+| Markdown in your files (converted to plain text) | Pinning a comment (the API has no call for it) |
+| Hashtags | Comments under other people's posts |
 | Private notes below the post that are never sent | |
+| A first comment under your own post, right after it or after a delay (needs the optional community app) | |
 
 ## Read this before you start: scheduling needs something that runs
 
@@ -127,21 +128,57 @@ it expires, so it does not surprise you on the morning you want to post.
 
 ## Community Management API (optional)
 
-The Community Management API cannot be added to the app you post with, so it needs a second
-app and token. Posting keeps running on the main token.
+The first comment (see *First comment*) goes out with a second token, from a second app that
+has the Community Management API. That API is not self-serve: LinkedIn reviews every request.
+Posting keeps running on the main token.
 
-1. Create the second app with the Community Management API product and the redirect URL
-   `http://localhost:8765/callback`, the same as the main app.
-2. Put its credentials in `.env` under their own keys. The main keys are never used for this
+### Who can get it, and why a second app
+
+LinkedIn only gives the Community Management API to registered legal organizations, for
+commercial use cases (see LinkedIn's
+[Community Management App Review](https://learn.microsoft.com/en-us/linkedin/marketing/community-management-app-review)
+page). LinkedIn also says: "Only request Community Management API Development Tier access with
+new developer applications that don't have access to other API products."
+([FAQ](https://learn.microsoft.com/en-us/linkedin/marketing/community-management/community-management-overview))
+The app you post with already has *Share on LinkedIn* and *Sign In with LinkedIn using OpenID
+Connect*. That is why the Community Management API needs a second app, separate from it.
+
+LinkedIn's [restricted uses](https://learn.microsoft.com/en-us/linkedin/marketing/restricted-use-cases)
+apply: member data from this API may not be used for sales, lead generation or CRM.
+
+### Get access
+
+1. **Create the second app** at <https://www.linkedin.com/developers/apps/new>. It must belong
+   to your LinkedIn Page, like the main app.
+2. **Settings tab.** A super admin of that Page has to verify the app, as with the main app.
+3. **Products tab.** Request access to the Community Management API, while the app has no other
+   product. LinkedIn reviews the request. You get the Development Tier first.
+4. **Auth tab.** After access is granted, add exactly `http://localhost:8765/callback` under
+   *Authorized redirect URLs*, the same as the main app.
+
+The Development Tier allows 500 calls per app and 100 per member per 24 hours, with no webhooks
+([Increasing Access](https://learn.microsoft.com/en-us/linkedin/marketing/increasing-access)).
+That is plenty for one person's posts and comments. The Standard Tier needs an App Review with a
+screencast of the app in use (*Request upgrade* on the Products tab). Only ask for it once
+something runs.
+
+### Connect it
+
+1. Put its credentials in `.env` under their own keys. The main keys are never used for this
    app, even when they are set in your environment:
    ```
    LINKEDIN_COMMUNITY_CLIENT_ID=...
    LINKEDIN_COMMUNITY_CLIENT_SECRET=...
    ```
-3. Add `[community]` to `publisher.toml`. Optional: `tokens_file` and `scopes`.
-4. Run `linkedin-publisher auth --app community` in a browser signed in as the same member as
-   the main app. The author comes from `/v2/me`, and a different member is refused. `refresh
-   --app community` works like `refresh`.
+2. Add `[community]` to `publisher.toml`. Optional: `tokens_file` and `scopes`. Without `scopes`
+   the tool asks for `r_basicprofile w_member_social w_member_social_feed r_member_postAnalytics
+   r_member_profileAnalytics` (`COMMUNITY_SCOPES` in `src/linkedin_publisher/config.py`).
+3. Run `linkedin-publisher auth --app community` in a browser signed in as the same member as
+   the main app. Do this after access is granted: access to a product does not add scopes to a
+   token you already have, so you sign in once more. The author comes from `/v2/me`, and a
+   different member is refused. The same member has a different `urn:li:person` id on each app,
+   so the tool compares the two logins by name and you do not need to compare the urns by hand.
+   `refresh --app community` works like `refresh`.
 
 ## First comment
 
