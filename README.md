@@ -125,6 +125,24 @@ Most self-serve apps do not get a refresh token. The access token lasts about 60
 that, run `linkedin-publisher auth` again. `due` and `status` warn you from seven days before
 it expires, so it does not surprise you on the morning you want to post.
 
+## Community Management API (optional)
+
+The Community Management API cannot be added to the app you post with, so it needs a second
+app and token. Posting keeps running on the main token.
+
+1. Create the second app with the Community Management API product and the redirect URL
+   `http://localhost:8765/callback`, the same as the main app.
+2. Put its credentials in `.env` under their own keys. The main keys are never used for this
+   app, even when they are set in your environment:
+   ```
+   LINKEDIN_COMMUNITY_CLIENT_ID=...
+   LINKEDIN_COMMUNITY_CLIENT_SECRET=...
+   ```
+3. Add `[community]` to `publisher.toml`. Optional: `tokens_file` and `scopes`.
+4. Run `linkedin-publisher auth --app community` in a browser signed in as the same member as
+   the main app. The author comes from `/v2/me`, and a different member is refused. `refresh
+   --app community` works like `refresh`.
+
 ## Write a post
 
 ```markdown
