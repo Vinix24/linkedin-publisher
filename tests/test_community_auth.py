@@ -89,13 +89,27 @@ def test_authorize_community_uses_its_scopes_keys_and_me(community_cfg, login, m
     assert "me1" in community_cfg.community_tokens_file.read_text() and not community_cfg.tokens_file.exists()
 
 
-def test_authorize_community_refuses_another_account(community_cfg, login, monkeypatch):
+@pytest.mark.parametrize("userinfo, saved, logged", [
+    (Reply(200, {"name": "Ann  Other"}), False, None),           # another member: refused
+    (Reply(200, {"given_name": "jan", "family_name": "Jansen"}), True, "Signed in as: Jan Jansen"),
+    (Reply(401, {}), True, "could not be cross-checked"),        # main token expired: not blocking
+])
+def test_authorize_community_compares_accounts_by_name(community_cfg, login, monkeypatch,
+                                                       userinfo, saved, logged):
+    """Person ids differ per app, so a different id for the same member must not refuse."""
     community_cfg.env_file.write_text(COMMUNITY_ENV)
-    community_cfg.tokens_file.write_text(json.dumps({"author_urn": "urn:li:person:main1"}))
-    monkeypatch.setattr(api.requests, "get", lambda *_a, **_k: Reply(200, {"id": "other"}))
-    with pytest.raises(api.PublisherError, match="different LinkedIn account"):
-        api.authorize(community_cfg, lambda _m: None, "community")
-    assert not community_cfg.community_tokens_file.exists()
+    community_cfg.tokens_file.write_text(json.dumps({"author_urn": "urn:li:person:main1",
+                                                     "access_token": "main-tok"}))
+    me = Reply(200, {"id": "app2id", "localizedFirstName": "Jan", "localizedLastName": "Jansen"})
+    monkeypatch.setattr(api.requests, "get", lambda url, **_: me if url == api.ME_URL else userinfo)
+    lines = []
+    if not saved:
+        with pytest.raises(api.PublisherError, match="different LinkedIn account"):
+            api.authorize(community_cfg, lines.append, "community")
+    else:
+        assert api.authorize(community_cfg, lines.append, "community") == "urn:li:person:app2id"
+        assert any(logged in line for line in lines)
+    assert community_cfg.community_tokens_file.exists() is saved
 
 
 def test_status_shows_community_token_only_when_configured(community_cfg, capsys):

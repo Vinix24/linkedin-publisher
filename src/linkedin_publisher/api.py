@@ -135,13 +135,28 @@ def parse_me(body: dict[str, Any]) -> str:
     return f"urn:li:person:{member_id}"
 
 
-def check_same_account(cfg: Config, community_author: str) -> None:
-    if not cfg.tokens_file.exists():
+def _name(*parts: Any) -> str:
+    return " ".join(" ".join(str(p) for p in parts if p).split())
+
+
+def check_same_account(cfg: Config, community_name: str, log: Log) -> None:
+    """Compare the two logins by display name. Person ids differ per LinkedIn app, so the
+    community URN never equals the main one, even for the same member."""
+    main_token = (json.loads(cfg.tokens_file.read_text(encoding="utf-8")).get("access_token")
+                  if cfg.tokens_file.exists() and community_name else None)
+    try:
+        who = requests.get(USERINFO_URL, headers={"Authorization": f"Bearer {main_token}"},
+                           timeout=30) if main_token else None
+    except requests.RequestException:
+        who = None
+    if who is None or who.status_code != 200:
+        log("The account could not be cross-checked against the main token.")
         return
-    main_author = json.loads(cfg.tokens_file.read_text(encoding="utf-8")).get("author_urn")
-    if main_author and main_author != community_author:
+    body = who.json()
+    main_name = _name(body.get("name")) or _name(body.get("given_name"), body.get("family_name"))
+    if main_name.casefold() != community_name.casefold():
         raise PublisherError(f"The browser was signed in to a different LinkedIn account: "
-                             f"{community_author}, but the main token is for {main_author}. "
+                             f"{community_name!r}, but the main token is for {main_name!r}. "
                              "The community token was not saved.")
 
 
@@ -215,8 +230,11 @@ def authorize(cfg: Config, log: Log = print, app: str = "main") -> str:
                              f"{who.text}. " + ("Does the community app have the r_basicprofile scope?"
                              if community else "Is 'Sign In with LinkedIn using OpenID Connect' added to your app?"))
     if community:
-        author = parse_me(who.json())
-        check_same_account(cfg, author)
+        me = who.json()
+        author = parse_me(me)
+        name = _name(me.get("localizedFirstName"), me.get("localizedLastName"))
+        check_same_account(cfg, name, log)
+        log(f"Signed in as: {name or author}")
     else:
         member_id = who.json().get("sub")
         if not member_id:
