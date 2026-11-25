@@ -250,3 +250,37 @@ def test_precheck_reports_a_scheduled_comment_whose_token_is_invalid_at_its_due_
     problem = json.loads(capsys.readouterr().out)["scheduled_comments"][0]
     assert problem["post"] == "a.md" and "expired" in problem["problem"]
     assert "LinkedIn precheck: a first comment will not be placed" in delayed.titles()
+
+
+# ------------------------------------------------------------------ the review round of the first comment
+
+def test_a_delayed_comment_follows_the_post_when_the_name_is_taken(delayed):
+    delayed.cfg.published_dir.mkdir(parents=True)
+    (delayed.cfg.published_dir / "a.md").write_text("---\nstatus: published\n---\n\nOld post.\n", encoding="utf-8")
+    scheduled_post(delayed)
+    published = delayed.cfg.published_dir
+    assert (published / "a-2.comment.md").exists() and not (published / "a.comment.md").exists()
+    assert [item.path.name for item in firstcomment.scheduled(delayed.cfg)] == ["a-2.md"]
+    tick(delayed, 31)
+    assert delayed.sent == [(POST_URN, COMMENT)]
+    assert queue.read_post(published / "a-2.md").meta["comment_status"] == "placed"
+
+
+def test_a_manual_retry_stays_out_while_another_run_holds_the_claim_of_the_comment(delayed, capsys):
+    import os
+    published = scheduled_post(delayed)
+    key = queue.content_key("Hello world.")
+    assert claims.take(delayed.cfg, firstcomment.claim_key(key), "a.md#comment")
+    claims.claim_path(delayed.cfg, firstcomment.claim_key(key)).write_text(json.dumps(
+        {"pid": os.getppid(), "file": "a.md#comment", "claimed_at": dt.datetime.now(dt.UTC).isoformat()}))
+    assert delayed.run("publish", "--comment-retry", "--file", str(published)) == 1
+    assert delayed.sent == [] and "still holds the claim" in capsys.readouterr().err
+
+
+def test_after_a_manual_retry_the_sweep_does_not_send_the_comment_again(delayed):
+    published = scheduled_post(delayed)
+    assert delayed.run("publish", "--comment-retry", "--file", str(published)) == 0
+    key = queue.content_key("Hello world.")
+    assert claims.exists(delayed.cfg, firstcomment.claim_key(key))
+    tick(delayed, 31)
+    assert delayed.sent == [(POST_URN, COMMENT)]
