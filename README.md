@@ -143,6 +143,22 @@ app and token. Posting keeps running on the main token.
    the main app. The author comes from `/v2/me`, and a different member is refused. `refresh
    --app community` works like `refresh`.
 
+## First comment
+
+A post can carry a first comment, placed right after the post with the community token. Put the
+text in a file with the post's name and the ending `.comment.md`, next to it: `example.md` +
+`example.comment.md`. It is plain text and goes out as it is, with no escaping.
+
+- The approval key covers the comment. Approving a post approves its comment, and changing the
+  comment voids the approval. A post without a comment keeps the key it had.
+- The comment never changes the status of the post. Its outcome goes into the receipts
+  (`comment-attempt`, `comment-placed`, `comment-failed`, `comment-uncertain`), into the published
+  file as `comment_status`, and through `[notify]` when it did not work.
+- An unclear comment is never sent again by itself. Look at the post, then place it by hand with
+  `linkedin-publisher publish --comment-retry --file <published post>`. It refuses when a receipt
+  shows the comment was placed.
+- Without a valid community token the post still goes out. `precheck` reports it in advance.
+
 ## Write a post
 
 ```markdown

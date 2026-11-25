@@ -39,6 +39,16 @@ class Post:
     stranded: bool = False
     video: Path | None = None
     document: Path | None = None
+    comment: str | None = None
+    comment_path: Path | None = None
+
+
+COMMENT_SUFFIX = ".comment.md"
+
+
+def comment_path_for(md_path: Path) -> Path:
+    """The first comment of a post is a file with the same name: post.md + post.comment.md."""
+    return md_path.with_name(md_path.stem + COMMENT_SUFFIX)
 
 
 def find_image(md_path: Path) -> Path | None:
@@ -74,9 +84,13 @@ def read_post(md_path: Path) -> Post:
 
 def parse_post(md_path: Path, raw: str) -> Post:
     fm_lines, body = frontmatter.split(raw)
+    comment_path = comment_path_for(md_path)
+    has_comment = comment_path.exists()
     return Post(path=md_path, meta=frontmatter.parse(fm_lines), body=body.strip(),
                 fm_lines=fm_lines, image=find_image(md_path), video=find_video(md_path),
-                document=find_document(md_path))
+                document=find_document(md_path),
+                comment=comment_path.read_text(encoding="utf-8").strip() if has_comment else None,
+                comment_path=comment_path if has_comment else None)
 
 
 @dataclass
@@ -143,6 +157,8 @@ def content_problem(post: Post, cfg: Config) -> str | None:
     text = post_text(post.body, cfg.notes_headings)
     if not text:
         return "empty post text"
+    if post.comment_path and not post.comment:
+        return f"{post.comment_path.name} is empty. Write the first comment in it, or remove the file"
     if post.meta.get("format") == "image":
         if not post.image:
             return "format is image but there is no image file next to the post"
@@ -193,7 +209,7 @@ def queue_files(cfg: Config) -> list[Path]:
             "that runs this tool Full Disk Access, or move the queue out of Desktop and "
             "Documents.") from exc
     return sorted(cfg.queue_dir / n for n in names
-                  if n.endswith(".md") and n.lower() != "readme.md")
+                  if n.endswith(".md") and not n.endswith(COMMENT_SUFFIX) and n.lower() != "readme.md")
 
 
 def held_by_earlier_attempt(cfg: Config, post: Post) -> bool:
@@ -323,7 +339,7 @@ def move_to_published(post: Post, cfg: Config, post_url: str, posted_on: dt.date
     target = _unique_target(cfg.published_dir, post.path.name)
     target.write_text(new_raw, encoding="utf-8")
     post.path.unlink()
-    for media in (post.image, post.video, post.document):
+    for media in (post.image, post.video, post.document, post.comment_path):
         if media:
             shutil.move(str(media), str(_unique_target(cfg.published_dir, media.name)))
     return target
@@ -342,7 +358,7 @@ def write_receipt(cfg: Config, stage: str, post: Post | None = None, *,
     """Append-only NDJSON, one file per day.
 
     stage: attempt | placed | uncertain | failed | preflight-rejected | move-failed | one of
-    NOTE_STAGES. Without a post, key and file_name say which post it is about (a claim has
+    NOTE_STAGES (the comment stages included; their ref is the comment id). Without a post, key and file_name say which post it is about (a claim has
     no post file to read). ref says which version of the subject a note is about, so a note
     is written once per version and not once per run."""
     now = dt.datetime.now(dt.UTC)
@@ -365,8 +381,9 @@ def write_receipt(cfg: Config, stage: str, post: Post | None = None, *,
 
 UNCERTAIN_STAGES = {"attempt", "uncertain"}
 # Notes tell a person something once. They are not outcomes and must never stand in for one.
+COMMENT_STAGES = frozenset({"comment-attempt", "comment-placed", "comment-failed", "comment-uncertain"})
 NOTE_STAGES = frozenset({"stranded", "approval-missing", "approval-mismatch", "claim-unresolved",
-                         "measured", "measure-failed", "check-failed", "precheck"})
+                         "measured", "measure-failed", "check-failed", "precheck"}) | COMMENT_STAGES
 
 
 def _receipt_rows(cfg: Config):
@@ -397,6 +414,24 @@ def load_states(cfg: Config) -> dict[str, str]:
             continue
         states[key] = stage
     return states
+
+
+def load_comment_states(cfg: Config) -> dict[str, str]:
+    """Latest comment stage per content key. The comment of a post has its own stages and never
+    changes the state of the post itself: load_states ignores them. 'comment-placed' is final."""
+    states: dict[str, str] = {}
+    for row in _receipt_rows(cfg):
+        key, stage = row.get("content_key"), row.get("stage")
+        if key and stage in COMMENT_STAGES and states.get(key) != "comment-placed":
+            states[key] = stage
+    return states
+
+
+def placed_urn(cfg: Config, key: str) -> str | None:
+    """The post URN from the 'placed' receipt of a post, or None when it was never placed."""
+    urns = [row.get("post_urn") for row in _receipt_rows(cfg)
+            if row.get("stage") == "placed" and row.get("content_key") == key and row.get("post_urn")]
+    return urns[-1] if urns else None
 
 
 def load_placed_keys(cfg: Config) -> set[str]:

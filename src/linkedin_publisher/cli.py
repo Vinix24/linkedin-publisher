@@ -14,8 +14,8 @@ from pathlib import Path
 
 import requests
 
-from . import (__version__, api, approval, checks, claims, cloud, littletext, measures, precheck,
-               postqueue as queue, schedule, templates)
+from . import (__version__, api, approval, checks, claims, cloud, firstcomment, littletext, measures,
+               precheck, postqueue as queue, schedule, templates)
 from .config import DEFAULT_CONFIG_NAME, Config, ConfigError, load_config
 
 TOKEN_WARN_DAYS = 7
@@ -468,7 +468,7 @@ REQUIRE_APPROVAL_MESSAGE = ("--require-approval was given, but [approval] requir
 
 
 def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None, retry: bool = False,
-                require_approval: bool = False) -> int:
+                require_approval: bool = False, comment_retry: bool = False) -> int:
     """mode: dry (show) | notify (signal, never post) | post (post for real).
 
     ``require_approval`` is for a job nobody watches. ``[approval] required`` is off by default, and a
@@ -482,6 +482,8 @@ def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None, ret
         alert(cfg, REQUIRE_APPROVAL_TITLE, REQUIRE_APPROVAL_MESSAGE)
         raise api.PublisherError(REQUIRE_APPROVAL_MESSAGE)
     log = make_log(cfg)
+    if comment_retry:
+        return 0 if firstcomment.retry(cfg, only, log, alert) == firstcomment.PLACED else 1
     scheduled = mode == "notify" or (mode == "post" and only is None)
     report_code = 0
     if scheduled:
@@ -556,6 +558,8 @@ def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None, ret
         print("-" * 60)
         print(commentary)
         print("-" * 60)
+        if post.comment:
+            print(f"first comment, placed after the post:\n{post.comment}\n" + "-" * 60)
         print("Add --post to publish it for real.")
         return 0
 
@@ -612,16 +616,22 @@ def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None, ret
         # Written before the file moves, so a failed move can never lead to
         # posting the same text twice. The claim stays for good as well.
         queue.write_receipt(cfg, "placed", post, post_urn=urn, post_url=url)
+        target: Path | None
         try:
             target = queue.move_to_published(post, cfg, url, now.date())
         except OSError as exc:
+            target = None
             queue.write_receipt(cfg, "move-failed", post, post_urn=urn, post_url=url, error=str(exc))
             log(f"WARNING: {post.path.name} is live ({url}) but could not be moved: {exc}. "
                 "It will not be offered again. Move it by hand.")
             alert(cfg, "LinkedIn post is live, cleanup failed", f"{post.path.stem}: move it by hand.")
+        else:
+            log(f"Posted: {post.path.name} -> {url}")
+            log(f"Moved to {target}")
+        # The comment is a separate act: whatever happens to it, the post stays placed.
+        firstcomment.place(cfg, post, urn, target or post.path, log, alert)
+        if target is None:
             return 1
-        log(f"Posted: {post.path.name} -> {url}")
-        log(f"Moved to {target}")
         alert(cfg, "LinkedIn post is live", f"{post.path.stem}. The first hour counts, answer comments.")
         return report_code
     finally:
@@ -848,6 +858,9 @@ def build_parser() -> argparse.ArgumentParser:
                      help="for a job nobody watches: stop with an error and a notification, and send nothing, "
                           "unless [approval] required = true in the configuration")
     pub.add_argument("--file", help="post this file now, outside its slot")
+    pub.add_argument("--comment-retry", action="store_true",
+                     help="with --file: place the first comment of a post that is live, after you checked "
+                          "LinkedIn. Refused when a receipt shows the comment was placed")
     pub.add_argument("--retry", action="store_true",
                      help="with --file: try again after an unclear outcome, once you checked LinkedIn")
     return parser
@@ -884,9 +897,12 @@ def main(argv: list[str] | None = None) -> int:
         elif command == "publish":
             mode = "post" if args.post else "notify" if args.notify else "dry"
             only = resolve_file(cfg, args.file) if args.file else None
-            if args.retry and only is None:
-                raise api.PublisherError("--retry only works together with --file.")
-            return cmd_publish(cfg, now, mode, only, args.retry, args.require_approval)
+            if (args.retry or args.comment_retry) and only is None:
+                raise api.PublisherError("--retry and --comment-retry only work together with --file.")
+            if args.comment_retry and (args.retry or mode != "dry"):
+                raise api.PublisherError("--comment-retry stands alone with --file: it takes neither "
+                                         "--retry, --post nor --notify.")
+            return cmd_publish(cfg, now, mode, only, args.retry, args.require_approval, args.comment_retry)
         return 0
     except (ConfigError, api.PublisherError, schedule.ScheduleError, queue.QueueUnreadable) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
