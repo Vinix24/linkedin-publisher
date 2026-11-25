@@ -314,19 +314,22 @@ linkedin-publisher comment \
   refuses to list the comments (a 4xx: the app gets 403 under other people's posts) it is
   `unverifiable`.
 - **Once.** The whole history of the digest and target decides, not its last receipt. A plain run
-  sends nothing after a `comment-placed`, after a `comment-uncertain` anywhere in the history, or after
-  an attempt or a retry with no outcome after it. That covers an unclear answer, a 201 without an id, a
-  run that died mid-request and a placed receipt that could not be written. A `comment-failed` right
-  after an attempt, with nothing unclear before it, allows a rerun: nothing was sent.
+  sends only when the history is empty, or holds nothing but attempts that each got their own
+  `comment-failed` right after them: a clear refusal, so nothing went out. A `comment-failed` with no
+  attempt before it was a refusal before the request, and changes nothing.
+- **Sticky.** Any `comment-retry`, `comment-uncertain` or `comment-placed`, or an attempt without its
+  own outcome right after it, makes the key sticky. From then on a plain run is refused for good, also
+  after a retry that failed. That covers an unclear answer, a 201 without an id, a run that died
+  mid-request and a placed receipt that could not be written.
 - **`--retry-unclear`** is for a person who checked the comment is not there. It sends once more and
-  writes a `comment-retry` receipt first. It is refused when nothing is unclear or the comment was
-  placed. A retry that fails does not open plain sending again: the job stays refused, and only another
-  `--retry-unclear` or a `--verify` that finds the comment gets past it.
+  writes a `comment-retry` receipt first. It is allowed when the key is sticky and nothing was placed,
+  and refused when nothing is unclear or the comment was placed. A `--verify` that finds the comment
+  writes `comment-placed`, which closes the key for every run.
 - **One run at a time.** A run takes a claim (`.receipts/claims/`) before it reads the receipts and
   removes it after the outcome receipt. A second run that overlaps is refused. If the claim cannot be
   removed, a warning goes to stderr and the status stays what it was.
-- **A claim left by a run that died.** A plain run takes it over when no attempt or retry was written
-  after it, because then nothing was sent. It writes a `comment-claim-recovered` note. Otherwise only
+- **A claim left by a run that died.** A plain run takes it over when the history is clear as above,
+  so everything written after the claim is too, and nothing went out. It writes a `comment-claim-recovered` note. Otherwise only
   `--retry-unclear` takes it over, once its process is gone. A refused run never touches a claim it did
   not take. A scheduled run reports a claim that outlives `claim_unresolved_minutes` without an outcome
   as a comment, with this advice.

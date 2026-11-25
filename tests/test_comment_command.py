@@ -200,15 +200,22 @@ def test_after_an_unclear_attempt_only_retry_unclear_sends_again(lp, capsys, lef
     assert code == 2 and "placed here already" in out["error"] and len(lp.calls) == 1
 
 
+A, F, R, U, PL = "comment-attempt", "comment-failed", "comment-retry", "comment-uncertain", "comment-placed"
+
+
 @pytest.mark.parametrize("flag", [(), ("--retry-unclear",)])
 @pytest.mark.parametrize("history, plain, retry", [
+    # clear: a plain run sends, --retry-unclear is refused (nothing is unclear)
     ([], 0, 2),
-    (["comment-failed"], 0, 2),                                     # the token failed: nothing was sent
-    (["comment-attempt", "comment-failed"], 0, 2),                  # a clear refusal: nothing was sent
-    (["comment-attempt"], 2, 0), (["comment-retry"], 2, 0), (["comment-uncertain"], 2, 0),
-    (["comment-attempt", "comment-uncertain", "comment-retry", "comment-failed"], 2, 0),       # retry: token failed
-    (["comment-attempt", "comment-uncertain", "comment-retry", "comment-attempt", "comment-failed"], 2, 0),  # retry: 4xx
-    (["comment-placed"], 2, 2), (["comment-uncertain", "comment-retry", "comment-attempt", "comment-placed"], 2, 2),
+    ([F], 0, 2),                                 # refused before the request: changes nothing
+    ([A, F], 0, 2), ([A, F, A, F], 0, 2),        # closed pairs: each attempt got its own failed right after it
+    # sticky: a plain run is refused for good, --retry-unclear sends
+    ([A], 2, 0), ([R], 2, 0), ([U], 2, 0), ([A, A, F], 2, 0), ([R, F], 2, 0), ([A, F, R, F], 2, 0),
+    ([A, R, F], 2, 0),                           # died mid-request, then the retry failed on the token
+    ([A, R, A, F], 2, 0),                        # died mid-request, then the retry got a clear 4xx
+    ([A, U, R, F], 2, 0), ([A, U, R, A, F], 2, 0),
+    # placed: both are refused
+    ([PL], 2, 2), ([A, PL], 2, 2), ([U, R, A, PL], 2, 2),
 ])
 def test_the_whole_history_decides_not_the_latest_receipt(lp, capsys, history, plain, retry, flag):
     for stage in history:
@@ -217,14 +224,18 @@ def test_the_whole_history_decides_not_the_latest_receipt(lp, capsys, history, p
     assert code == (retry if flag else plain) and len(lp.calls) == (code == 0)
 
 
-@pytest.mark.parametrize("retry_fails", ["token", "4xx"])
-def test_a_failed_retry_does_not_open_plain_sending(lp, capsys, monkeypatch, retry_fails):
+@pytest.mark.parametrize("start, retry_fails", [("uncertain", "token"), ("uncertain", "4xx"),
+                                                ("died", "token"), ("died", "4xx")])
+def test_a_failed_retry_does_not_open_plain_sending(lp, capsys, monkeypatch, start, retry_fails):
     def answer(result):
         monkeypatch.setattr(api, "place_comment", lambda *_a, **_k: lp.calls.append("sent") or (
             raising(result)() if isinstance(result, Exception) else result))
 
-    answer(api.PublishUncertain("timeout"))
-    assert run(lp, capsys, *ARGS)[0] == 3
+    if start == "uncertain":
+        answer(api.PublishUncertain("timeout"))
+        assert run(lp, capsys, *ARGS)[0] == 3
+    else:                                               # the run died between its attempt receipt and an answer
+        linkcomment.receipt(lp.cfg, A, links.parse_target(POST_LINK), DIGEST)
     if retry_fails == "token":
         lp.cfg.community_tokens_file.unlink()
     else:
@@ -234,7 +245,7 @@ def test_a_failed_retry_does_not_open_plain_sending(lp, capsys, monkeypatch, ret
     answer("901")
     code, out = run(lp, capsys, *ARGS)                  # the unattended job after a person's one retry
     assert code == 2 and "may have gone through" in out["error"]
-    assert lp.calls == ["sent"] * (1 if retry_fails == "token" else 2)
+    assert lp.calls == ["sent"] * ((start == "uncertain") + (retry_fails == "4xx"))
 
 
 def test_two_unclear_runs_send_once(lp, capsys, monkeypatch):
@@ -307,6 +318,15 @@ def test_a_dead_claim_with_an_attempt_after_it_waits_for_a_person(lp, capsys):
     assert (code, lp.calls) == (2, []) and "claim" in out["error"] and path.read_bytes() == before
     assert run(lp, capsys, *ARGS, "--retry-unclear")[0] == 0 and len(lp.calls) == 1
     assert stages(lp) == ["comment-attempt", "comment-retry", "comment-attempt", "comment-placed"]
+
+
+def test_a_dead_claim_after_closed_pairs_is_taken_over_by_a_plain_run(lp, capsys):
+    """A failed release, or a run that died between its failed receipt and the release: nothing went out."""
+    path = dead_claim(lp)
+    for stage in (A, F):
+        linkcomment.receipt(lp.cfg, stage, links.parse_target(POST_LINK), DIGEST)
+    assert run(lp, capsys, *ARGS)[0] == 0 and len(lp.calls) == 1 and not path.exists()
+    assert stages(lp) == [A, F, "comment-claim-recovered", A, PL]
 
 
 def age(setup, path, minutes):

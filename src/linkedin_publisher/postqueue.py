@@ -469,11 +469,13 @@ def rows_of(cfg: Config, key: str) -> list[dict[str, Any]]:
 
 
 def written_since(row: dict[str, Any], moment: dt.datetime) -> bool:
-    """Whether a receipt row was written at or after ``moment``, which is timezone-aware."""
+    """Whether a receipt row was written at or after ``moment``, which is timezone-aware. A timestamp without a
+    zone is UTC: that is what the receipts are written in."""
     try:
-        return dt.datetime.fromisoformat(str(row.get("timestamp"))) >= moment
-    except (TypeError, ValueError):
+        stamp = dt.datetime.fromisoformat(str(row.get("timestamp")))
+    except ValueError:
         return False
+    return (stamp if stamp.tzinfo else stamp.replace(tzinfo=dt.UTC)) >= moment
 
 
 def load_comment_states(cfg: Config) -> dict[str, str]:

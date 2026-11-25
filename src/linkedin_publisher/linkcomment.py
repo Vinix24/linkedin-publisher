@@ -167,25 +167,34 @@ def read_back(cfg: Config, target: links.Target, digest: str) -> dict[str, Any]:
     return {"status": "not-found"}
 
 
-def unclear(stages: list[str]) -> bool:
-    """An uncertain answer anywhere in the history, or an attempt or retry with no outcome after it."""
-    open_send = False
+def sticky(stages: list[str]) -> bool:
+    """Whether the history may hold a comment that went out. Clear is only: nothing, or attempts that each got
+    their own comment-failed right after them. A comment-failed with no attempt before it was a refusal before the
+    request and changes nothing. Any retry, uncertain or placed, or an attempt without its own outcome right after
+    it, makes the key sticky for good. Notes do not count."""
+    waiting = False                       # an attempt whose outcome must come next
     for stage in stages:
-        if stage in SENDS:
-            open_send = True
-        elif stage in queue.COMMENT_OUTCOMES:
-            open_send = False
-    return open_send or "comment-uncertain" in stages
+        if stage not in SENDS and stage not in queue.COMMENT_OUTCOMES:
+            continue
+        if waiting:
+            if stage != "comment-failed":
+                return True
+            waiting = False
+        elif stage == "comment-attempt":
+            waiting = True
+        elif stage != "comment-failed":
+            return True
+    return waiting
 
 
 def refusal(stages: list[str], retry_unclear: bool) -> str | None:
     """Why this run may not send, decided on the whole history of this text on this target, never on its last
-    receipt: a failed retry must not open plain sending again. None when it may send."""
+    receipt (see sticky). None when it may send."""
     if "comment-placed" in stages:
         return "a receipt shows this text was placed here already. Nothing was sent."
-    if retry_unclear and not unclear(stages):
+    if retry_unclear and not sticky(stages):
         return "--retry-unclear is only for an unclear earlier attempt, and there is none here. Nothing was sent."
-    if not retry_unclear and unclear(stages):
+    if not retry_unclear and sticky(stages):
         return ("an earlier attempt may have gone through. Nothing was sent. Read it back with --verify. "
                 "If a person checked it is not there, add --retry-unclear.")
     return None
@@ -215,20 +224,16 @@ def place(cfg: Config, target: links.Target, body: str, digest: str, retry_uncle
 
 def take_over(cfg: Config, target: links.Target, digest: str, ckey: str, retry_unclear: bool) -> None:
     """A claim is there: a run that is sending, or one that died. This is decided before the claim is touched,
-    so a refused run leaves it as it is. A plain run takes over a dead claim only when no attempt or retry was
-    written after it was taken: nothing was sent, and a comment-claim-recovered note says so. --retry-unclear
-    takes over one whose history is unclear. A claim whose process still runs is never taken over."""
+    so a refused run leaves it as it is. A plain run takes over a dead claim when the history is clear (see
+    sticky), and so everything written after the claim as well: nothing went out, and a comment-claim-recovered
+    note says so. --retry-unclear takes over one whose history is sticky. A claim whose process still runs is
+    never taken over."""
     holder = claims.read(cfg, ckey)
     if holder is None:
         return
 
     def reason() -> str | None:
-        rows = queue.rows_of(cfg, receipt_key(target, digest))
-        why = refusal([row.get("stage") for row in rows], retry_unclear)
-        if why is None and not retry_unclear and any(
-                row.get("stage") in SENDS and queue.written_since(row, holder.claimed_at) for row in rows):
-            why = "the run that holds it may have sent it. Nothing was sent. Read it back with --verify."
-        return why
+        return refusal(stages_of(cfg, target, digest), retry_unclear)
 
     why = reason()
     if why:

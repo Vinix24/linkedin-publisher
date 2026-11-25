@@ -208,6 +208,14 @@ def test_a_first_comment_claim_without_an_outcome_gets_the_advice_of_a_comment(c
     assert comments.titles() == ["LinkedIn first comment: claimed but no outcome"]
 
 
+def test_a_receipt_time_without_a_zone_is_utc():
+    moment = dt.datetime(2026, 11, 25, 12, 0, tzinfo=dt.UTC)
+    assert queue.written_since({"timestamp": "2026-11-25T12:00:01"}, moment)
+    assert not queue.written_since({"timestamp": "2026-11-25T11:59:59"}, moment)
+    assert queue.written_since({"timestamp": "2026-11-25T13:30:00+01:00"}, moment)
+    assert not queue.written_since({"timestamp": "not a time"}, moment) and not queue.written_since({}, moment)
+
+
 def test_comment_retry_needs_a_placed_post_and_a_comment(comments, capsys):
     path = with_comment(comments)
     assert comments.run("publish", "--comment-retry", "--file", str(path)) == 1
