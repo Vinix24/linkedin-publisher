@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 from conftest import CREDS, TOKENS, Setup
 
-from linkedin_publisher import api, approval, cli, littletext
+from linkedin_publisher import api, approval, claims, cli, firstcomment, littletext
 from linkedin_publisher import postqueue as queue
 
 POST_URN = "urn:li:share:1"
@@ -173,6 +173,39 @@ def test_comment_retry_places_a_failed_comment_and_then_refuses(comments, monkey
     assert queue.read_post(published).meta["comment_status"] == "placed"
     assert comments.run("publish", "--comment-retry", "--file", str(published)) == 1
     assert len(comments.sent) == 1
+
+
+def age_claim(setup, ckey, minutes):
+    path = claims.claim_path(setup.cfg, ckey)
+    row = json.loads(path.read_text())
+    path.write_text(json.dumps(row | {"claimed_at": (dt.datetime.now(dt.UTC) - dt.timedelta(minutes=minutes)).isoformat()}))
+
+
+def test_the_claim_of_a_placed_first_comment_is_not_reported_as_unresolved(comments, monkeypatch, capsys):
+    """Existing behaviour that was wrong: the claim stays after a placed comment, and the next scheduled run
+    reported it as a post claimed without an outcome, with the advice to post it again."""
+    monkeypatch.setattr(api, "place_comment", raising(api.PublisherError("503")))
+    comments.run("publish", "--post", "--file", str(with_comment(comments)))
+    published = comments.cfg.published_dir / "a.md"
+    monkeypatch.setattr(api, "place_comment", lambda *_a, **_k: "888")
+    assert comments.run("publish", "--comment-retry", "--file", str(published)) == 0
+    ckey = firstcomment.claim_key(queue.post_key(queue.read_post(published), comments.cfg))
+    assert claims.exists(comments.cfg, ckey)
+    age_claim(comments, ckey, 120)
+    capsys.readouterr()
+    assert comments.run("publish", "--notify") == 0
+    assert "claim-unresolved" not in comments.receipt_stages() and "claimed" not in capsys.readouterr().out
+    assert not any("claimed but no outcome" in title for title in comments.titles())
+
+
+def test_a_first_comment_claim_without_an_outcome_gets_the_advice_of_a_comment(comments, capsys):
+    ckey = firstcomment.claim_key("c" * 64)
+    assert claims.take(comments.cfg, ckey, "a.md#comment")
+    age_claim(comments, ckey, 120)
+    assert comments.run("publish", "--notify") == 3
+    out = capsys.readouterr().out
+    assert "--comment-retry" in out and "--retry" not in out.replace("--comment-retry", "")
+    assert comments.titles() == ["LinkedIn first comment: claimed but no outcome"]
 
 
 def test_comment_retry_needs_a_placed_post_and_a_comment(comments, capsys):

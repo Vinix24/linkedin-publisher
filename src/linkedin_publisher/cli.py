@@ -342,7 +342,11 @@ def report_unresolved_claims(cfg: Config, now: dt.datetime, log) -> int:
     Only 'placed' finishes a claim. 'failed' and 'preflight-rejected' remove their claim right after
     the receipt, so a claim that outlives the limit next to one of them is a later attempt that
     died, or a run that stopped between the two steps. The old receipt says nothing about it.
-    Returns 3 when there was something new to report."""
+    Returns 3 when there was something new to report.
+
+    The claim of a first comment (``comment-<post key>``) stays after a placed or unclear comment. It is
+    left alone when a comment outcome was written after it was taken, and otherwise gets the advice of a
+    comment, never the one of a post."""
     states = queue.load_states(cfg)
     noted = queue.load_notes(cfg, "claim-unresolved")
     moment = now.astimezone(dt.UTC)
@@ -354,19 +358,32 @@ def report_unresolved_claims(cfg: Config, now: dt.datetime, log) -> int:
         claim = claims.read(cfg, key)
         if claim is None or moment - claim.claimed_at <= limit:
             continue
+        comment_key = key.removeprefix("comment-") if key.startswith("comment-") else None
+        if comment_key and has_comment_outcome_since(cfg, comment_key, claim.claimed_at):
+            continue
         ref = claim.claimed_at.isoformat()
         if (key, ref) in noted:
             continue
         name = claim.file or key[:12]
         minutes = int((moment - claim.claimed_at).total_seconds() // 60)
         queue.write_receipt(cfg, "claim-unresolved", key=key, file_name=claim.file, ref=ref)
-        log(f"{name} was claimed {minutes} minutes ago and has no outcome. It will not be posted again. "
-            "Check LinkedIn. If the post is not there, post it again with: "
-            f"linkedin-publisher publish --post --file <the post> --retry")
-        alert(cfg, "LinkedIn post: claimed but no outcome",
-              f"{name} was claimed {minutes} minutes ago and has no outcome. Check LinkedIn.")
+        if comment_key:
+            title = "LinkedIn first comment: claimed but no outcome"
+            advice = ("It will not be placed again by itself. Check LinkedIn. If the comment is not there: "
+                      "linkedin-publisher publish --comment-retry --file <the published post>")
+        else:
+            title = "LinkedIn post: claimed but no outcome"
+            advice = ("It will not be posted again. Check LinkedIn. If the post is not there, post it again with: "
+                      "linkedin-publisher publish --post --file <the post> --retry")
+        log(f"{name} was claimed {minutes} minutes ago and has no outcome. {advice}")
+        alert(cfg, title, f"{name} was claimed {minutes} minutes ago and has no outcome. Check LinkedIn.")
         new += 1
     return 3 if new else 0
+
+
+def has_comment_outcome_since(cfg: Config, key: str, moment: dt.datetime) -> bool:
+    return any(row.get("stage") in queue.COMMENT_OUTCOMES and queue.written_since(row, moment)
+               for row in queue.rows_of(cfg, key))
 
 
 APPROVAL_NOTICES = {

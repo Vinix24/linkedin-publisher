@@ -459,6 +459,22 @@ def load_states(cfg: Config) -> dict[str, str]:
     return states
 
 
+COMMENT_OUTCOMES = COMMENT_STAGES - {"comment-attempt"}
+
+
+def rows_of(cfg: Config, key: str) -> list[dict[str, Any]]:
+    """Every receipt row of one content key, in the order it was written."""
+    return [row for row in _receipt_rows(cfg) if isinstance(row, dict) and row.get("content_key") == key]
+
+
+def written_since(row: dict[str, Any], moment: dt.datetime) -> bool:
+    """Whether a receipt row was written at or after ``moment``, which is timezone-aware."""
+    try:
+        return dt.datetime.fromisoformat(str(row.get("timestamp"))) >= moment
+    except (TypeError, ValueError):
+        return False
+
+
 def load_comment_states(cfg: Config) -> dict[str, str]:
     """Latest comment stage per content key. The comment of a post has its own stages and never
     changes the state of the post itself: load_states ignores them. 'comment-placed' is final."""
