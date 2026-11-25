@@ -94,7 +94,7 @@ def test_payload_and_url():
     assert api.comments_url(POST_URN) == "https://api.linkedin.com/rest/socialActions/urn%3Ali%3Ashare%3A1/comments"
 
 
-def test_place_comment_sends_headers_and_reads_the_id(cfg, monkeypatch):
+def test_place_comment_sends_headers_and_reads_the_id(cfg, monkeypatch, allow_linkedin_send_under_test):
     seen = {}
 
     def post(url, headers, json, timeout):
@@ -114,7 +114,7 @@ def test_place_comment_sends_headers_and_reads_the_id(cfg, monkeypatch):
     (answer(429, text="throttled"), False), (answer(403, text="no"), False),
     (answer(503), True), (answer(201), True),
 ])
-def test_place_comment_answers(cfg, monkeypatch, reply, uncertain):
+def test_place_comment_answers(cfg, monkeypatch, reply, uncertain, allow_linkedin_send_under_test):
     monkeypatch.setattr(api.requests, "post", lambda *_a, **_k: reply)
     with pytest.raises(api.PublisherError) as caught:
         api.place_comment(cfg, CREDS, COMMUNITY_TOKENS, POST_URN, "Hi")
