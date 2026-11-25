@@ -23,8 +23,12 @@ def answer(status, headers=None, text=""):
 
 @pytest.fixture
 def comments(tmp_path, monkeypatch):
+    return community_setup(tmp_path, monkeypatch)
+
+
+def community_setup(tmp_path, monkeypatch, extra=""):
     """A setup with a community token and a fake LinkedIn. `sent` lists the comments placed."""
-    setup = Setup(tmp_path, '[community]\ntokens_file = "community.json"\n')
+    setup = Setup(tmp_path, '[community]\ntokens_file = "community.json"\n' + extra)
     setup.install_fake_linkedin(monkeypatch)
     setup.cfg.community_tokens_file.write_text(json.dumps(COMMUNITY_TOKENS))
     setup.sent = []
@@ -185,3 +189,164 @@ def test_precheck_reports_a_comment_without_a_community_token(comments, capsys):
     assert cli.cmd_precheck(comments.cfg, EVENING_BEFORE, 1, True) == 3
     problem = json.loads(capsys.readouterr().out)["posts"][0]["problems"][0]
     assert problem["kind"] == "comment" and "no community token" in problem["message"]
+
+
+# ------------------------------------------------------------------ review round: what a comment must survive
+
+def failed_meta(setup, name="a.md"):
+    return queue.read_post(setup.cfg.published_dir / name).meta
+
+
+def test_a_network_error_while_refreshing_the_community_token_fails_only_the_comment(comments, monkeypatch):
+    def refresh(_cfg, _creds, tokens, *_a):
+        if tokens is COMMUNITY_TOKENS:
+            raise api.requests.ConnectionError("no route")
+        return tokens
+
+    monkeypatch.setattr(api, "ensure_access_token", refresh)
+    assert comments.run("publish", "--post", "--file", str(with_comment(comments))) == 0
+    assert comments.receipt_stages() == ["attempt", "placed", "comment-failed"]
+    assert published_meta(comments)["comment_status"] == "failed"
+    assert "LinkedIn first comment not placed" in comments.titles()
+
+
+def test_a_broken_community_token_file_fails_only_the_comment_and_is_a_precheck_problem(comments, monkeypatch, capsys):
+    comments.cfg.community_tokens_file.write_text("")
+    monkeypatch.undo()
+    real_read = api.read_tokens
+    monkeypatch.setattr(cli, "notify", lambda title, message: None)
+    path = with_comment(comments)
+    assert cli.cmd_precheck(comments.cfg, EVENING_BEFORE, 1, True) == 3
+    assert "cannot be read" in json.loads(capsys.readouterr().out)["posts"][0]["problems"][0]["message"]
+    comments.install_fake_linkedin(monkeypatch)
+    monkeypatch.setattr(api, "load_credentials", lambda _cfg, app="main": CREDS)
+    monkeypatch.setattr(api, "read_tokens", lambda cfg, app="main": real_read(cfg, app) if app == "community" else TOKENS)
+    assert comments.run("publish", "--post", "--file", str(path)) == 0
+    assert comment_stages(comments) == ["comment-failed"]
+
+
+def test_a_status_that_cannot_be_written_does_not_undo_a_placed_comment(comments, monkeypatch):
+    monkeypatch.setattr(firstcomment_module().frontmatter, "set_fields", raising(OSError("iCloud said no")))
+    assert comments.run("publish", "--post", "--file", str(with_comment(comments))) == 0
+    assert comment_stages(comments) == ["comment-attempt", "comment-placed"]
+    assert comments.sent == [(POST_URN, COMMENT)]
+
+
+def firstcomment_module():
+    from linkedin_publisher import firstcomment
+    return firstcomment
+
+
+def test_the_comment_follows_the_post_when_the_name_is_taken(comments, monkeypatch):
+    comments.cfg.published_dir.mkdir(parents=True)
+    (comments.cfg.published_dir / "a.md").write_text("---\nstatus: published\n---\n\nOld post.\n", encoding="utf-8")
+    monkeypatch.setattr(api, "place_comment", raising(api.PublisherError("503")))
+    assert comments.run("publish", "--post", "--file", str(with_comment(comments))) == 0
+    published = comments.cfg.published_dir
+    assert (published / "a-2.md").exists() and (published / "a-2.comment.md").exists()
+    assert not (published / "a.comment.md").exists()
+    monkeypatch.setattr(api, "place_comment", lambda _c, _cr, _t, urn, text, url=None:
+                        comments.sent.append((urn, text)) or "888")
+    assert comments.run("publish", "--comment-retry", "--file", str(published / "a-2.md")) == 0
+    assert comments.sent == [(POST_URN, COMMENT)]
+
+
+def test_a_comment_file_left_behind_in_published_is_not_taken_over(comments):
+    published = comments.cfg.published_dir
+    published.mkdir(parents=True)
+    (published / "a.md").write_text("---\nstatus: published\n---\n\nOld post.\n", encoding="utf-8")
+    (published / "a-2.comment.md").write_text("Someone else's comment\n", encoding="utf-8")
+    assert comments.run("publish", "--post", "--file", str(with_comment(comments))) == 0
+    assert (published / "a-3.md").exists()
+    assert (published / "a-3.comment.md").read_text(encoding="utf-8").strip() == COMMENT
+    assert (published / "a-2.comment.md").read_text(encoding="utf-8").strip() == "Someone else's comment"
+
+
+@pytest.mark.parametrize("tokens, problem", [
+    ({"access_token": "c", "author_urn": "x", "access_expires_at": "2026-09-22T23:00:00"}, "expires within a day"),
+    ({"access_token": "c", "author_urn": "x", "refresh_token": "r", "access_expires_at": "2026-09-01T00:00:00",
+      "refresh_expires_at": "2026-09-20T00:00:00"}, "refresh token has expired"),
+])
+def test_the_community_check_matches_what_placing_the_comment_does(tmp_path, tokens, problem):
+    setup = Setup(tmp_path, '[community]\ntokens_file = "community.json"\n')
+    setup.cfg.community_tokens_file.write_text(json.dumps(tokens))
+    assert problem in api.community_problem(setup.cfg, EVENING_BEFORE)
+
+
+def test_a_refresh_token_that_is_still_valid_makes_an_expired_access_token_fine(tmp_path):
+    setup = Setup(tmp_path, '[community]\ntokens_file = "community.json"\n')
+    setup.cfg.community_tokens_file.write_text(json.dumps({
+        "access_token": "c", "author_urn": "x", "refresh_token": "r", "access_expires_at": "2026-09-01T00:00:00",
+        "refresh_expires_at": "2027-01-01T00:00:00"}))
+    assert api.community_problem(setup.cfg, EVENING_BEFORE) is None
+
+
+def test_comment_retry_refuses_an_unapproved_comment_when_approval_is_required(tmp_path, monkeypatch):
+    setup = community_setup(tmp_path, monkeypatch, "[approval]\nrequired = true\n")
+    monkeypatch.setattr(api, "place_comment", raising(api.PublisherError("503")))
+    path = with_comment(setup)
+    approval.approve(setup.cfg, path, "Test Person")
+    assert setup.run("publish", "--post", "--file", str(path)) == 0
+    published = setup.cfg.published_dir / "a.md"
+    queue.comment_path_for(published).write_text("A changed comment\n", encoding="utf-8")
+    monkeypatch.setattr(api, "place_comment", lambda _c, _cr, _t, urn, text, url=None:
+                        setup.sent.append((urn, text)) or "888")
+    assert setup.run("publish", "--comment-retry", "--file", str(published)) == 1
+    assert setup.sent == []
+    queue.comment_path_for(published).write_text(COMMENT + "\n", encoding="utf-8")      # the approved version again
+    assert setup.run("publish", "--comment-retry", "--file", str(published)) == 0
+    assert setup.sent == [(POST_URN, COMMENT)]
+
+
+def failed_post(comments, monkeypatch):
+    monkeypatch.setattr(api, "place_comment", raising(api.PublisherError("503")))
+    comments.run("publish", "--post", "--file", str(with_comment(comments)))
+    monkeypatch.setattr(api, "place_comment", lambda _c, _cr, _t, urn, text, url=None:
+                        comments.sent.append((urn, text)) or "888")
+    return comments.cfg.published_dir / "a.md"
+
+
+def test_comment_retry_takes_the_claim_of_the_comment_and_a_second_one_stays_out(comments, monkeypatch, capsys):
+    from linkedin_publisher import claims, firstcomment
+    published = failed_post(comments, monkeypatch)
+    key = queue.content_key(queue.post_text(queue.read_post(published).body, comments.cfg.notes_headings))
+    assert claims.take(comments.cfg, firstcomment.claim_key(key), "a.md#comment")      # a sweep holds it
+    claims.claim_path(comments.cfg, firstcomment.claim_key(key)).write_text(
+        json.dumps({"pid": __import__("os").getppid(), "file": "a.md#comment",
+                    "claimed_at": dt.datetime.now(dt.UTC).isoformat()}))
+    assert comments.run("publish", "--comment-retry", "--file", str(published)) == 1
+    assert comments.sent == [] and "still holds the claim" in capsys.readouterr().err
+
+
+def test_comment_retry_leaves_a_claim_after_placing_and_releases_it_after_a_failure(comments, monkeypatch):
+    from linkedin_publisher import claims, firstcomment
+    published = failed_post(comments, monkeypatch)
+    key = queue.content_key(queue.post_text(queue.read_post(published).body, comments.cfg.notes_headings))
+    ckey = firstcomment.claim_key(key)
+    monkeypatch.setattr(api, "place_comment", raising(api.PublisherError("503 again")))
+    assert comments.run("publish", "--comment-retry", "--file", str(published)) == 1
+    assert not claims.exists(comments.cfg, ckey)
+    monkeypatch.setattr(api, "place_comment", lambda _c, _cr, _t, urn, text, url=None:
+                        comments.sent.append((urn, text)) or "888")
+    assert comments.run("publish", "--comment-retry", "--file", str(published)) == 0
+    assert claims.exists(comments.cfg, ckey)
+
+
+def test_the_comment_file_is_refused_as_a_post_and_for_approval(comments, capsys):
+    path = with_comment(comments)
+    sidecar = queue.comment_path_for(path)
+    assert comments.run("publish", "--post", "--file", str(sidecar)) == 1
+    assert "first comment of a post, not a post" in capsys.readouterr().err
+    assert comments.run("approve", "--file", str(sidecar), "--by", "Test Person") == 1
+    assert comments.sends == [] and comments.receipt_stages() == []
+    assert "approved_key" not in sidecar.read_text(encoding="utf-8")
+
+
+def test_an_unreadable_comment_file_does_not_stop_the_measure_run(comments):
+    path = comments.post("a.md", {"measure": "count"})
+    queue.comment_path_for(path).mkdir()          # exists, but reading it raises an OSError
+    comments.post("b.md")
+    lines = []
+    assert cli.measure_post(comments.cfg, path, EVENING_BEFORE, dt.date(2026, 9, 24), set(), lines.append) == 0
+    assert any("first comment" in line for line in lines)
+    assert cli.cmd_measure(comments.cfg, EVENING_BEFORE, 1) == 0

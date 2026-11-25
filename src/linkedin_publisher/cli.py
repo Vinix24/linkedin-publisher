@@ -248,7 +248,15 @@ def cmd_schedule(cfg: Config, action: str, auto: bool) -> None:
         print(last_check_line(cfg))
 
 
+def refuse_comment_file(path: Path) -> None:
+    """The file of a first comment is the text of a comment, never a post of its own."""
+    if path.name.endswith(queue.COMMENT_SUFFIX):
+        raise api.PublisherError(f"{path.name} is the first comment of a post, not a post. Use the file of the "
+                                 f"post: {path.name[:-len(queue.COMMENT_SUFFIX)]}.md")
+
+
 def cmd_approve(cfg: Config, path: Path, by: str) -> None:
+    refuse_comment_file(path)
     if not path.exists():
         raise api.PublisherError(f"{path} does not exist.")
     key = approval.approve(cfg, path, by)
@@ -482,6 +490,8 @@ def cmd_publish(cfg: Config, now: dt.datetime, mode: str, only: Path | None, ret
         alert(cfg, REQUIRE_APPROVAL_TITLE, REQUIRE_APPROVAL_MESSAGE)
         raise api.PublisherError(REQUIRE_APPROVAL_MESSAGE)
     log = make_log(cfg)
+    if only is not None:
+        refuse_comment_file(only)
     if comment_retry:
         return 0 if firstcomment.retry(cfg, only, log, alert) == firstcomment.PLACED else 1
     scheduled = mode == "notify" or (mode == "post" and only is None)
@@ -667,7 +677,11 @@ def measure_post(cfg: Config, path: Path, now: dt.datetime, last: dt.date, noted
     except (OSError, UnicodeDecodeError) as exc:
         log(f"Not measuring {path.name}: cannot read the file: {exc}")
         return 0
-    post = queue.parse_post(path, raw)
+    try:
+        post = queue.parse_post(path, raw)
+    except (OSError, UnicodeDecodeError) as exc:
+        log(f"Not measuring {path.name}: cannot read the file of its first comment: {exc}")
+        return 0
     name = post.meta.get(cfg.measure_field)
     slot = queue.slot_datetime(post.meta, cfg)
     if post.meta.get("status") != cfg.ready_status or not name or slot is None \

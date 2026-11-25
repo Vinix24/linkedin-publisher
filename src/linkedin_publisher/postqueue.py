@@ -308,18 +308,15 @@ def collect(cfg: Config, now: dt.datetime) -> tuple[list[Post], list[Post]]:
     return ready, skipped
 
 
-def _unique_target(directory: Path, name: str) -> Path:
-    """Never overwrite a file that is already in the published folder."""
-    candidate = directory / name
-    if not candidate.exists():
-        return candidate
+def _unique_target(directory: Path, name: str, with_comment: bool = False) -> Path:
+    """Never overwrite a file that is already in the published folder. With ``with_comment`` the
+    comment file that will sit next to the target must be free as well."""
     stem, suffix = Path(name).stem, Path(name).suffix
-    counter = 2
-    while True:
+    candidate, counter = directory / name, 2
+    while candidate.exists() or (with_comment and comment_path_for(candidate).exists()):
         candidate = directory / f"{stem}-{counter}{suffix}"
-        if not candidate.exists():
-            return candidate
         counter += 1
+    return candidate
 
 
 def move_to_published(post: Post, cfg: Config, post_url: str, posted_on: dt.date) -> Path:
@@ -336,12 +333,14 @@ def move_to_published(post: Post, cfg: Config, post_url: str, posted_on: dt.date
     new_raw = "---\n" + "\n".join(kept) + "\n---\n\n" + post.body.strip() + "\n"
 
     cfg.published_dir.mkdir(parents=True, exist_ok=True)
-    target = _unique_target(cfg.published_dir, post.path.name)
+    target = _unique_target(cfg.published_dir, post.path.name, with_comment=bool(post.comment_path))
     target.write_text(new_raw, encoding="utf-8")
     post.path.unlink()
-    for media in (post.image, post.video, post.document, post.comment_path):
+    for media in (post.image, post.video, post.document):
         if media:
             shutil.move(str(media), str(_unique_target(cfg.published_dir, media.name)))
+    if post.comment_path:
+        shutil.move(str(post.comment_path), str(comment_path_for(target)))   # the comment follows the final name of the post
     return target
 
 

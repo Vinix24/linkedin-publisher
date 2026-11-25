@@ -494,17 +494,31 @@ def _post_id(resp: requests.Response) -> str:
 
 
 def community_problem(cfg: Config, now: dt.datetime | None = None) -> str | None:
-    """Why the community token cannot place a comment right now, or None when it can.
+    """Why the community token cannot place a comment at ``now``, or None when it can.
 
-    An expired access token is fine when a refresh token exists: placing the comment refreshes it."""
+    It judges what placing the comment does (see ``ensure_access_token``). With a refresh token the access
+    token is renewed when it is within a day of expiring, so the refresh token must still be valid. Without
+    one, the access token must have more than a day left."""
     if cfg.community_tokens_file is None:
         return "the [community] section is missing from the configuration"
     if not cfg.community_tokens_file.exists():
         return f"there is no community token yet. Run: {auth_command('community')}"
-    tokens = read_tokens(cfg, "community")
-    days = token_days_left(cfg, now, "community")
-    if (days is None or days <= 0) and not tokens.get("refresh_token"):
-        return f"the community token has expired. Run: {auth_command('community')}"
+    now = now or dt.datetime.now()
+    try:
+        tokens = read_tokens(cfg, "community")
+        if not isinstance(tokens, dict):
+            raise ValueError("not a JSON object")
+        days = token_days_left(cfg, now, "community")
+        refresh_expires = tokens.get("refresh_expires_at")
+        refresh_ends = dt.datetime.fromisoformat(refresh_expires) if refresh_expires else None
+    except (OSError, ValueError) as exc:
+        return f"the community token file cannot be read ({exc}). Run: {auth_command('community')}"
+    if tokens.get("refresh_token"):
+        if refresh_ends is not None and refresh_ends <= now:
+            return f"the community refresh token has expired. Run: {auth_command('community')}"
+        return None
+    if days is None or days <= 1:
+        return f"the community token has expired or expires within a day, and there is no refresh token. Run: {auth_command('community')}"
     return None
 
 
