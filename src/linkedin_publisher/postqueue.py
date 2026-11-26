@@ -394,13 +394,13 @@ def move_to_published(post: Post, cfg: Config, post_url: str, posted_on: dt.date
 def write_receipt(cfg: Config, stage: str, post: Post | None = None, *,
                   post_urn: str | None = None, post_url: str | None = None,
                   error: str | None = None, key: str | None = None, file_name: str | None = None,
-                  ref: str | None = None) -> None:
+                  ref: str | None = None, fields: dict[str, Any] | None = None) -> None:
     """Append-only NDJSON, one file per day.
 
     stage: attempt | placed | uncertain | failed | preflight-rejected | move-failed | one of
     NOTE_STAGES (the comment stages included; their ref is the comment id). Without a post, key and file_name say which post it is about (a claim has
     no post file to read). ref says which version of the subject a note is about, so a note
-    is written once per version and not once per run."""
+    is written once per version and not once per run. fields are added to the row as they are."""
     now = dt.datetime.now(dt.UTC)
     row: dict[str, Any] = {
         "event": "linkedin_publish",
@@ -414,6 +414,7 @@ def write_receipt(cfg: Config, stage: str, post: Post | None = None, *,
     }
     if ref is not None:
         row["ref"] = ref
+    row.update(fields or {})
     cfg.receipts_dir.mkdir(parents=True, exist_ok=True)
     with (cfg.receipts_dir / f"{now:%Y-%m-%d}.ndjson").open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(row) + "\n")
@@ -425,7 +426,8 @@ COMMENT_STAGES = frozenset({"comment-attempt", "comment-placed", "comment-failed
 # A scheduled comment is a note about the future, not an outcome: it never counts as placed or attempted.
 NOTE_STAGES = frozenset({"stranded", "approval-missing", "approval-mismatch", "claim-unresolved",
                          "measured", "measure-failed", "check-failed", "precheck",
-                         "comment-scheduled", "page-problem"}) | COMMENT_STAGES
+                         "comment-scheduled", "page-problem", "comment-retry",
+                         "comment-claim-recovered"}) | COMMENT_STAGES
 
 
 def _receipt_rows(cfg: Config):
@@ -456,6 +458,24 @@ def load_states(cfg: Config) -> dict[str, str]:
             continue
         states[key] = stage
     return states
+
+
+COMMENT_OUTCOMES = COMMENT_STAGES - {"comment-attempt"}
+
+
+def rows_of(cfg: Config, key: str) -> list[dict[str, Any]]:
+    """Every receipt row of one content key, in the order it was written."""
+    return [row for row in _receipt_rows(cfg) if isinstance(row, dict) and row.get("content_key") == key]
+
+
+def written_since(row: dict[str, Any], moment: dt.datetime) -> bool:
+    """Whether a receipt row was written at or after ``moment``, which is timezone-aware. A timestamp without a
+    zone is UTC: that is what the receipts are written in."""
+    try:
+        stamp = dt.datetime.fromisoformat(str(row.get("timestamp")))
+    except ValueError:
+        return False
+    return (stamp if stamp.tzinfo else stamp.replace(tzinfo=dt.UTC)) >= moment
 
 
 def load_comment_states(cfg: Config) -> dict[str, str]:

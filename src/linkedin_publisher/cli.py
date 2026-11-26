@@ -14,8 +14,8 @@ from pathlib import Path
 
 import requests
 
-from . import (__version__, api, approval, checks, claims, cloud, firstcomment, littletext, measures,
-               precheck, postqueue as queue, schedule, templates)
+from . import (__version__, api, approval, checks, claims, cloud, firstcomment, linkcomment, littletext,
+               measures, precheck, postqueue as queue, schedule, templates)
 from .config import DEFAULT_CONFIG_NAME, Config, ConfigError, load_config
 
 TOKEN_WARN_DAYS = 7
@@ -342,7 +342,11 @@ def report_unresolved_claims(cfg: Config, now: dt.datetime, log) -> int:
     Only 'placed' finishes a claim. 'failed' and 'preflight-rejected' remove their claim right after
     the receipt, so a claim that outlives the limit next to one of them is a later attempt that
     died, or a run that stopped between the two steps. The old receipt says nothing about it.
-    Returns 3 when there was something new to report."""
+    Returns 3 when there was something new to report.
+
+    The claim of a first comment (``comment-<post key>``) stays after a placed or unclear comment. It is
+    left alone when a comment outcome was written after it was taken, and otherwise gets the advice of a
+    comment, never the one of a post."""
     states = queue.load_states(cfg)
     noted = queue.load_notes(cfg, "claim-unresolved")
     moment = now.astimezone(dt.UTC)
@@ -354,19 +358,37 @@ def report_unresolved_claims(cfg: Config, now: dt.datetime, log) -> int:
         claim = claims.read(cfg, key)
         if claim is None or moment - claim.claimed_at <= limit:
             continue
+        link = key.startswith("link-comment-")       # a comment from a link: its claim names its receipt key
+        comment_key = claim.file if link else key.removeprefix("comment-") if key.startswith("comment-") else None
+        if comment_key and has_comment_outcome_since(cfg, comment_key, claim.claimed_at):
+            continue
         ref = claim.claimed_at.isoformat()
         if (key, ref) in noted:
             continue
         name = claim.file or key[:12]
         minutes = int((moment - claim.claimed_at).total_seconds() // 60)
         queue.write_receipt(cfg, "claim-unresolved", key=key, file_name=claim.file, ref=ref)
-        log(f"{name} was claimed {minutes} minutes ago and has no outcome. It will not be posted again. "
-            "Check LinkedIn. If the post is not there, post it again with: "
-            f"linkedin-publisher publish --post --file <the post> --retry")
-        alert(cfg, "LinkedIn post: claimed but no outcome",
-              f"{name} was claimed {minutes} minutes ago and has no outcome. Check LinkedIn.")
+        if link:
+            title = "LinkedIn comment: claimed but no outcome"
+            advice = ("It will not be sent again by itself. Read it back with linkedin-publisher comment ... "
+                      "--verify. If a person checked it is not there, run the same command with --retry-unclear")
+        elif comment_key:
+            title = "LinkedIn first comment: claimed but no outcome"
+            advice = ("It will not be placed again by itself. Check LinkedIn. If the comment is not there: "
+                      "linkedin-publisher publish --comment-retry --file <the published post>")
+        else:
+            title = "LinkedIn post: claimed but no outcome"
+            advice = ("It will not be posted again. Check LinkedIn. If the post is not there, post it again with: "
+                      "linkedin-publisher publish --post --file <the post> --retry")
+        log(f"{name} was claimed {minutes} minutes ago and has no outcome. {advice}")
+        alert(cfg, title, f"{name} was claimed {minutes} minutes ago and has no outcome. Check LinkedIn.")
         new += 1
     return 3 if new else 0
+
+
+def has_comment_outcome_since(cfg: Config, key: str, moment: dt.datetime) -> bool:
+    return any(row.get("stage") in queue.COMMENT_OUTCOMES and queue.written_since(row, moment)
+               for row in queue.rows_of(cfg, key))
 
 
 APPROVAL_NOTICES = {
@@ -980,6 +1002,20 @@ def build_parser() -> argparse.ArgumentParser:
                           "LinkedIn. Refused when a receipt shows the comment was placed")
     pub.add_argument("--retry", action="store_true",
                      help="with --file: try again after an unclear outcome, once you checked LinkedIn")
+    com = sub.add_parser("comment", help="place a comment, or an answer under a comment, from a link; only with "
+                                         "the digest of the approved text. One JSON line; exit 0, 2, 3 or 4")
+    com.add_argument("--on", required=True, metavar="LINK", help="link or URN of the post, or of the comment to answer")
+    text = com.add_mutually_exclusive_group(required=True)
+    text.add_argument("--text", help="the text of the comment")
+    text.add_argument("--text-file", metavar="PATH", help="a UTF-8 file with the text of the comment")
+    com.add_argument("--text-digest", metavar="HEX", help="required: sha256 of the approved text after normalization")
+    com.add_argument("--reply-to", metavar="LINK", help="link or URN of a comment under the post in --on: answer it")
+    look = com.add_mutually_exclusive_group()
+    look.add_argument("--dry-run", action="store_true", help="show the target, the payload and the digest; no network")
+    look.add_argument("--verify", action="store_true",
+                      help="read the comments back and look for this text from you; sends nothing")
+    look.add_argument("--retry-unclear", action="store_true",
+                      help="send again after an unclear attempt, once a person checked the comment is not there")
     return parser
 
 
@@ -1020,12 +1056,23 @@ def main(argv: list[str] | None = None) -> int:
                 raise api.PublisherError("--comment-retry stands alone with --file: it takes neither "
                                          "--retry, --post nor --notify.")
             return cmd_publish(cfg, now, mode, only, args.retry, args.require_approval, args.comment_retry)
+        elif command == "comment":
+            return linkcomment.run(cfg, args.on, args.text, args.text_file, args.text_digest, args.reply_to,
+                                   args.dry_run, args.verify, args.retry_unclear)
         return 0
     except (ConfigError, api.PublisherError, schedule.ScheduleError, queue.QueueUnreadable) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
+        if command == "comment":
+            linkcomment.error_line(str(exc))
         return 1
     except requests.RequestException as exc:
         print(f"ERROR: could not reach LinkedIn: {exc}", file=sys.stderr)
+        return 1
+    except OSError as exc:      # after RequestException, which is an OSError too
+        if command != "comment":
+            raise
+        print(f"ERROR: {exc}", file=sys.stderr)
+        linkcomment.error_line(str(exc))
         return 1
 
 
