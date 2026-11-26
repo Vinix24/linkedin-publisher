@@ -894,8 +894,8 @@ approvals, the measured number, the checks against a local web server, the prech
 the schedule files and the generated workflows. The calls to LinkedIn
 itself are not unit tested. `status --online` is the safe way to check them.
 
-A test run cannot post. `publish` and `place_comment` refuse while pytest runs, and every request
-to a host other than this machine fails the test.
+A test run cannot post. `publish`, `place_comment`, `place_reply` and `read_comments` refuse while
+pytest runs, and every request to a host other than this machine fails the test.
 
 ## License
 

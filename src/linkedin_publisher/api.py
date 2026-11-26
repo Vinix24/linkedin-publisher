@@ -565,8 +565,25 @@ def build_comment_payload(author: str, post_urn: str, text: str) -> dict[str, An
     return {"actor": author, "object": post_urn, "message": {"text": text}}
 
 
+def build_reply_payload(author: str, activity_urn: str, parent_comment_urn: str, text: str) -> dict[str, Any]:
+    """The JSON body of an answer, for POST /rest/socialActions/{comment urn}/comments. Pure, so it can be tested.
+
+    ``object`` is the activity of the post, not its share: the URN of the comment is built on the activity.
+    The text goes in as it is, as for a comment."""
+    return {"actor": author, "object": activity_urn, "parentComment": parent_comment_urn, "message": {"text": text}}
+
+
 def comments_url(post_urn: str) -> str:
     return f"{SOCIAL_ACTIONS_URL}/{urllib.parse.quote(post_urn, safe='')}/comments"
+
+
+def comment_headers(cfg: Config, creds: dict[str, str], tokens: dict[str, Any]) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {tokens['access_token']}",
+        "LinkedIn-Version": api_version(cfg, creds),
+        "X-Restli-Protocol-Version": "2.0.0",
+        "Content-Type": "application/json",
+    }
 
 
 def place_comment(cfg: Config, creds: dict[str, str], tokens: dict[str, Any], post_urn: str, text: str,
@@ -576,13 +593,23 @@ def place_comment(cfg: Config, creds: dict[str, str], tokens: dict[str, Any], po
     Every answer that is neither a success nor a clear refusal raises PublishUncertain: the
     comment may be there, and the caller never sends it a second time by itself."""
     refuse_in_a_test_run()
+    return _send_comment(cfg, creds, tokens, url or comments_url(post_urn),
+                         build_comment_payload(tokens["author_urn"], post_urn, text))
+
+
+def place_reply(cfg: Config, creds: dict[str, str], tokens: dict[str, Any], activity_urn: str,
+                parent_comment_urn: str, text: str) -> str:
+    """Answer a comment with the community token. Returns the id of the answer. The answers of LinkedIn
+    mean what they mean for place_comment. LinkedIn has one level of answers."""
+    refuse_in_a_test_run()
+    return _send_comment(cfg, creds, tokens, comments_url(parent_comment_urn),
+                         build_reply_payload(tokens["author_urn"], activity_urn, parent_comment_urn, text))
+
+
+def _send_comment(cfg: Config, creds: dict[str, str], tokens: dict[str, Any], url: str,
+                  payload: dict[str, Any]) -> str:
     try:
-        resp = requests.post(url or comments_url(post_urn), headers={
-            "Authorization": f"Bearer {tokens['access_token']}",
-            "LinkedIn-Version": api_version(cfg, creds),
-            "X-Restli-Protocol-Version": "2.0.0",
-            "Content-Type": "application/json",
-        }, json=build_comment_payload(tokens["author_urn"], post_urn, text), timeout=60)
+        resp = requests.post(url, headers=comment_headers(cfg, creds, tokens), json=payload, timeout=60)
     except requests.RequestException as exc:
         raise PublishUncertain(f"No clear answer from LinkedIn ({exc}). The comment may be there.") from exc
     if resp.status_code == 426:
@@ -597,6 +624,47 @@ def place_comment(cfg: Config, creds: dict[str, str], tokens: dict[str, Any], po
     if not comment_id:
         raise PublishUncertain("LinkedIn accepted the comment but returned no id. It is probably there.")
     return comment_id
+
+
+COMMENT_PAGES = 50
+
+
+def read_comments(cfg: Config, creds: dict[str, str], tokens: dict[str, Any], target_urn: str) -> list[Any]:
+    """The comments under a post, or the answers under a comment: GET on the path a comment is placed on,
+    every page. It sends nothing, and still refuses in a test run: it carries the token."""
+    refuse_in_a_test_run()
+    url, headers = comments_url(target_urn), comment_headers(cfg, creds, tokens)
+    return collect_comments(lambda start: requests.get(url, headers=headers, params={"start": start}, timeout=60))
+
+
+def collect_comments(get_page: Callable[[int], Any]) -> list[Any]:
+    """Every element of a list LinkedIn hands out in pages. ``get_page(start)`` asks for the page from ``start``.
+
+    It stops at an empty page or at ``paging.total``. A 4xx raises PublisherError. Every other answer that is
+    not a readable list raises PublishUncertain: a list that could not be read is never an empty one, or a
+    comment that is there would be reported as missing."""
+    found: list[Any] = []
+    for _page in range(COMMENT_PAGES):
+        try:
+            resp = get_page(len(found))
+        except requests.RequestException as exc:
+            raise PublishUncertain(f"No clear answer from LinkedIn while reading the comments ({exc}).") from exc
+        if 400 <= resp.status_code < 500:
+            raise PublisherError(f"LinkedIn refused to list the comments ({resp.status_code}): {resp.text}")
+        try:
+            body = resp.json() if resp.status_code == 200 else None
+        except ValueError:
+            body = None
+        elements = body.get("elements") if isinstance(body, dict) else None
+        if not isinstance(elements, list):
+            raise PublishUncertain(f"LinkedIn answered the list of comments with status {resp.status_code} "
+                                   "and no readable list.")
+        found += elements
+        paging = body.get("paging")
+        total = paging.get("total") if isinstance(paging, dict) else None
+        if not elements or (isinstance(total, int) and len(found) >= total):
+            return found
+    raise PublishUncertain(f"The list of comments did not end after {COMMENT_PAGES} pages. Not all were read.")
 
 
 def verify_online(cfg: Config) -> str:
